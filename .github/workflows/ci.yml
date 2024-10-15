@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - '**'  # 모든 브랜치에서 작동
+  pull_request:
+    branches:
+      - '**'
+
+jobs:
+  test_and_push:
+    name: Run tests and push Docker image
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v2
+        with:
+          python-version: 3.12
+
+      - name: Install dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          pip3 install -r src/requirements.txt
+
+      - name: Set Image Tag based on Docker Hub latest tag
+        id: set_image_tag
+        run: |
+          LATEST_TAG=$(curl -s -H "Authorization: Bearer ${{ secrets.DOCKER_TOKEN }}" "https://hub.docker.com/v2/repositories/jungeunyoon/order-service/tags?page_size=1" | jq -r '.results[0].name')
+          if [ -z "$LATEST_TAG" ]; then
+            LATEST_TAG="0.0.0"
+          fi
+          echo "Latest tag from Docker Hub: $LATEST_TAG"
+          MAJOR=$(echo $LATEST_TAG | cut -d. -f1)
+          MINOR=$(echo $LATEST_TAG | cut -d. -f2)
+          PATCH=$(echo $LATEST_TAG | cut -d. -f3)
+          if [ "${{ github.ref_name }}" == "main" ]; then
+            PATCH=$((PATCH + 1))
+            IMAGE_TAG="1.0.$PATCH"
+          else
+            PATCH=$((PATCH + 1))
+            IMAGE_TAG="0.0.$PATCH"
+          fi
+          echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
+          echo "Next image tag: $IMAGE_TAG"
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build and push Docker image
+        run: |
+          docker build -t jungeunyoon/order-service:${{ env.IMAGE_TAG }} .
+          docker push jungeunyoon/order-service:${{ env.IMAGE_TAG }}
+
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Create output
+        run: sh ./build.sh  # 빌드 스크립트 실행
+      
+      - name: Pushes to another repository
+        id: push_directory
+        uses: cpina/github-action-push-to-another-repository@main
+        env: 
+          API_TOKEN_GITHUB: ${{ secrets.PUSH_TOKEN }}
+        with:
+          source-directory: 'output'  # 빌드된 파일이 담긴 output 디렉토리를 지정
+          destination-github-username: 'Stockly-Project'  # 대상 유저 또는 오가니제이션
+          destination-repository-name: 'Order-Service'  # 푸시할 레포지토리
+          user-email: ${{ secrets.EMAIL }}
+          commit-message: ${{ github.event.head_commit.message }}  # 작성된 커밋 메시지를 그대로 사용
+          target-branch: 'main'  # 푸시할 브랜치
+      
+
+      - name: Test get variable exported by push-to-another-repository
+        run: echo $DESTINATION_CLONED_DIRECTORY
