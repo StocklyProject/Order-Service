@@ -75,7 +75,8 @@ jobs:
           destination-github-username: 'Stockly-Project'  # 대상 유저 또는 오가니제이션
           destination-repository-name: 'Order-Service'  # 푸시할 레포지토리
           user-email: ${{ secrets.EMAIL }}
-          commit-message: ${{ github.event.head_commit.message }}  # 작성된 커밋 메시지를 그대로 사용
+          commit-message: |
+            ${{ github.event.head_commit.message || 'feat: update repository' }}
           target-branch: 'main'  # 푸시할 브랜치
       
 
