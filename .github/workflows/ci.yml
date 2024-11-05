@@ -3,7 +3,7 @@ name: CI
 on:
   push:
     branches:
-      - '**'  # 모든 브랜치에서 작동
+      - main
   pull_request:
     branches:
       - '**'

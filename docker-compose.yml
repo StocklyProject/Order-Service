@@ -1,78 +1,30 @@
 version: '3.8'
 
 services:
-  python:
+  order-backend:
     build:
       context: .
       dockerfile: Dockerfile
     ports:
-      - "8000:8000"
+      - "8002:8002"
     networks:
-      - kafka-net
+      - order-net
 
-  mysql:
+  orderDB:
     image: mysql:latest
     ports:
-      - "3306:3306"
+      - "3305:3306"
     env_file:
-      - .env  # 동일한 환경 변수 파일을 사용
+      - .env
     volumes:
       - db-data:/var/lib/mysql
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+      - ./my.cnf:/etc/mysql/conf.d/my.cnf
     networks:
-      - kafka-net
-
-  # Zookeeper 설정 (1개 브로커)
-  zookeeper:
-    image: 'bitnami/zookeeper:3.7'
-    networks:
-      - kafka-net
-    ports:
-      - "2181:2181"
-    environment:
-      - ZOOKEEPER_SERVER_ID=1
-      - ALLOW_ANONYMOUS_LOGIN=yes
-      - ZOOKEEPER_CLIENT_PORT=2181
-      - ZOOKEEPER_TICK_TIME=2000
-      - ZOOKEEPER_INIT_LIMIT=5
-      - ZOOKEEPER_SYNC_LIMIT=2
-      - ZOOKEEPER_SERVERS=zookeeper:2181:2181
-
-  # Kafka 설정
-  kafka:
-    image: 'bitnami/kafka'
-    networks:
-      - kafka-net
-    ports:
-      - "9092:9092"
-    depends_on:
-      - zookeeper
-    environment:
-      - KAFKA_CFG_NODE_ID=1
-      - KAFKA_BROKER_ID=1
-      - KAFKA_ZOOKEEPER_CONNECT=zookeeper:2181
-      - KAFKA_CFG_LISTENERS=PLAINTEXT://localhost:9092,INTERNAL://kafka:9093
-      - KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://localhost:9092,INTERNAL://kafka:9093
-      - KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=PLAINTEXT:PLAINTEXT,INTERNAL:PLAINTEXT
-      - KAFKA_AUTO_CREATE_TOPICS_ENABLE=true
-      - ALLOW_PLAINTEXT_LISTENER=yes
-
-  # Kafka UI 설정
-  kafka-ui:
-    image: provectuslabs/kafka-ui
-    networks:
-      - kafka-net
-    ports:
-      - "8080:8080"
-    depends_on:
-      - kafka
-    environment:
-      - KAFKA_CLUSTERS_0_NAME=local-cluster
-      - KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS=kafka:9092
-      - KAFKA_CLUSTERS_0_ZOOKEEPER=zookeeper:2181
-      - KAFKA_CLUSTERS_0_READONLY=false
+      - order-net
 
 networks:
-  kafka-net:
+  order-net:
     driver: bridge
 
 volumes:
