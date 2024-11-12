@@ -1,5 +1,12 @@
 import mysql.connector
 import os
+import redis.asyncio as aioredis
+
+async def get_redis():
+    redis_url = os.getenv("REDIS_URL")
+    redis = await aioredis.from_url(redis_url)
+    return redis
+
 
 def get_db_connection():
     host = os.environ.get("MYSQL_HOST"),

@@ -1,6 +1,8 @@
 from .consumer import async_kafka_consumer
 import json
 import asyncio
+from .database import get_redis
+from fastapi import FastAPI, Depends, Request, HTTPException
 
 # SSE 비동기 이벤트 생성기
 async def sse_event_generator(topic: str, group_id: str, symbol: str):
@@ -17,8 +19,20 @@ async def sse_event_generator(topic: str, group_id: str, symbol: str):
             if isinstance(data, dict) and data.get("symbol") == symbol:
                 yield f"data: {json.dumps(data)}\n\n"  # 클라이언트에 데이터 전송
 
-            await asyncio.sleep(0.5)  # 메시지 간 대기 시간 설정
     except asyncio.CancelledError:
         pass
     finally:
         await consumer.stop()
+
+async def get_user_id_from_session(request: Request, redis=Depends(get_redis)):
+    # 쿠키에서 session_id 가져오기
+    session_id = request.cookies.get("session_id")
+    if not session_id:
+        raise HTTPException(status_code=401, detail="Session ID is missing")
+
+    # Redis에서 session_id로 user_id 조회
+    user_id = await redis.get(session_id)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Session has expired or is invalid")
+
+    return user_id.decode('utf-8')  # Redis에서 가져온 값을 문자열로 반환
