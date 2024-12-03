@@ -24,15 +24,12 @@ async def sse_event_generator(topic: str, group_id: str, symbol: str):
     finally:
         await consumer.stop()
 
-async def get_user_id_from_session(request: Request, redis=Depends(get_redis)):
-    # 쿠키에서 session_id 가져오기
-    session_id = request.cookies.get("session_id")
-    if not session_id:
-        raise HTTPException(status_code=401, detail="Session ID is missing")
+async def get_user_from_session(session_id: str, redis):
+    user_id_bytes = await redis.get(session_id)
 
-    # Redis에서 session_id로 user_id 조회
-    user_id = await redis.get(session_id)
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Session has expired or is invalid")
+    if user_id_bytes is None:
+        raise HTTPException(status_code=403, detail="세션이 만료되었거나 유효하지 않습니다.")
 
-    return user_id.decode('utf-8')  # Redis에서 가져온 값을 문자열로 반환
+    # 사용자 ID를 bytes에서 문자열로 변환 후 int로 변환
+    user_id = int(user_id_bytes.decode('utf-8'))
+    return int(user_id)
