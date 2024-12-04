@@ -9,7 +9,7 @@ async def get_redis():
 
 
 def get_db_connection():
-    host = os.environ.get("MYSQL_HOST"),
+    host = os.environ.get("MYSQL_HOST")
     user = os.getenv("MYSQL_USER")
     password = os.getenv("MYSQL_PASSWORD")
     database = os.getenv("MYSQL_DATABASE")

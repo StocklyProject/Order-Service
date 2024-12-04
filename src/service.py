@@ -33,3 +33,46 @@ async def get_user_from_session(session_id: str, redis):
     # 사용자 ID를 bytes에서 문자열로 변환 후 int로 변환
     user_id = int(user_id_bytes.decode('utf-8'))
     return int(user_id)
+
+
+# 사용자 조회 함수
+def get_user_by_id(user_id: int, db):
+    cursor = db.cursor(dictionary=True)
+    cursor.execute("SELECT * FROM user WHERE id = %s", (user_id,))
+    user = cursor.fetchone()
+    cursor.close()
+
+    if not user:
+        raise HTTPException(status_code=404, detail="사용자를 찾을 수 없습니다.")
+    return user
+
+# 사용자 금액 충전 함수
+def add_cash_to_user(user_id: int, amount: int, db):
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail="충전 금액은 0보다 커야 합니다.")
+    
+    cursor = db.cursor()
+    cursor.execute("UPDATE user SET cash = cash + %s WHERE id = %s", (amount, user_id))
+    db.commit()
+    cursor.close()
+
+def reset_user_assets(user_id: int, db):
+    """
+    사용자의 자산(현금, 포트폴리오, 주문 상태)을 초기화합니다.
+    """
+    cursor = db.cursor()
+
+    cursor.execute("""
+        UPDATE stock_order
+        SET is_deleted = TRUE
+        WHERE user_id = %s
+    """, (user_id,))
+
+    cursor.execute("""
+        UPDATE user
+        SET cash = 0, total_stock = 0, total_roi = 0.0, total_asset = 0
+        WHERE id = %s
+    """, (user_id,))
+
+    db.commit()
+    cursor.close()
