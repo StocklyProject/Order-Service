@@ -1,8 +1,10 @@
 from .consumer import async_kafka_consumer
 import json
 import asyncio
-from .database import get_redis
-from fastapi import FastAPI, Depends, Request, HTTPException
+from fastapi import HTTPException
+from datetime import datetime
+from .consumer import async_kafka_consumer
+from kafka import TopicPartition
 
 # SSE 비동기 이벤트 생성기
 async def sse_event_generator(topic: str, group_id: str, symbol: str):
@@ -52,10 +54,26 @@ def add_cash_to_user(user_id: int, amount: int, db):
         raise HTTPException(status_code=400, detail="충전 금액은 0보다 커야 합니다.")
     
     cursor = db.cursor()
-    cursor.execute("UPDATE user SET cash = cash + %s WHERE id = %s", (amount, user_id))
-    db.commit()
-    cursor.close()
 
+    try:
+        # cash 업데이트
+        cursor.execute("UPDATE user_data SET cash = cash + %s WHERE id = %s", (amount, user_id))
+
+        # total_asset 업데이트
+        cursor.execute("""
+            UPDATE user_data 
+            SET total_asset = cash + total_stock
+            WHERE id = %s
+        """, (user_id,))
+
+        # 변경사항 커밋
+        db.commit()
+    except Exception as e:
+        db.rollback()  # 문제가 생기면 롤백
+        raise HTTPException(status_code=500, detail="서버 오류로 인해 요청을 처리할 수 없습니다.") from e
+    finally:
+        cursor.close()
+        
 def reset_user_assets(user_id: int, db):
     """
     사용자의 자산(현금, 포트폴리오, 주문 상태)을 초기화합니다.
@@ -69,10 +87,28 @@ def reset_user_assets(user_id: int, db):
     """, (user_id,))
 
     cursor.execute("""
-        UPDATE user
+        UPDATE user_data
         SET cash = 0, total_stock = 0, total_roi = 0.0, total_asset = 0
         WHERE id = %s
     """, (user_id,))
 
     db.commit()
     cursor.close()
+
+
+
+async def fetch_latest_data_for_symbol(symbol: str):
+    """
+    Kafka에서 특정 토픽의 특정 심볼에 해당하는 최신 데이터 한 개를 가져오는 비동기 함수.
+    """
+    consumer = await async_kafka_consumer('real_time_asking_prices', f"order_consumer_{datetime.now().strftime('%Y%m%d%H%M%S%f')}")
+    try:
+        async for msg in consumer:
+            data = msg.value
+            if data.get("symbol") == symbol:
+                return data  
+
+    finally:
+        await consumer.stop()
+
+    return None
