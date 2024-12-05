@@ -6,6 +6,8 @@ from .service import get_user_from_session, get_user_by_id, add_cash_to_user, re
 from .database import get_db_connection, get_redis
 from .schemas import DepositRequest, OrderRequest
 from .logger import logger
+from .consumer import async_kafka_consumer
+import json
 
 KST = pytz.timezone('Asia/Seoul')
 
@@ -15,7 +17,7 @@ router = APIRouter(
 )
 
 # 실시간 호가 조회
-@router.get("/orderBook/{symbol}")
+@router.get("/orderBook/{symbol}/")
 async def get_order_book_sse(symbol: str):
     topic = "real_time_asking_prices"
     now_kst = datetime.now()
@@ -24,7 +26,7 @@ async def get_order_book_sse(symbol: str):
 
 
 # 자산 충전하기
-@router.post("/deposit")
+@router.post("/deposit/")
 async def deposit_money(request: Request, body: DepositRequest, redis=Depends(get_redis)):
     session_id = request.cookies.get("session_id")
     if not session_id:
@@ -58,7 +60,7 @@ async def reset_assets(request: Request, redis=Depends(get_redis)):
 
 
 # 매수/매도 주문 처리
-@router.post("/order")
+@router.post("/order/")
 async def process_order(
     request: Request,
     body: OrderRequest,
@@ -230,7 +232,7 @@ async def process_order(
 
 
 # 전체 주문 목록 조회
-@router.get('/stocks')
+@router.get('/stocks/')
 async def get_all_stocks(request: Request, redis=Depends(get_redis)):
     session_id = request.cookies.get("session_id")
     if not session_id:
@@ -243,7 +245,7 @@ async def get_all_stocks(request: Request, redis=Depends(get_redis)):
     finally:
         db.close()
 
-@router.get("/roi/daily")
+@router.get("/roi/daily/")
 async def get_user_daily_roi(request: Request, redis=Depends(get_redis)):
     session_id = request.cookies.get("session_id")
     if not session_id:
@@ -257,3 +259,185 @@ async def get_user_daily_roi(request: Request, redis=Depends(get_redis)):
         return {"message": "일일 수익률을 조회했습니다.", "total_roi": total_roi}
     finally:
         db.close()
+
+
+@router.get('/roi/realtime/total/')
+async def get_realtime_total_roi(request: Request, redis=Depends(get_redis)):
+    """
+    실시간 종합 주식 수익률 SSE 엔드포인트
+    """
+    session_id = request.cookies.get("session_id")
+    if not session_id:
+        raise HTTPException(status_code=401, detail="세션 ID가 없습니다.")
+    user_id = await get_user_from_session(session_id, redis)
+
+    # Kafka Consumer 초기화
+    topic = "real_time_stock_prices"
+    group_id = f"real_time_total_roi_{user_id}_{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
+    consumer = await async_kafka_consumer(topic, group_id)
+
+    async def event_stream():
+        try:
+            db = get_db_connection()
+            cursor = db.cursor(dictionary=True)
+
+            # 사용자 보유 주식 정보 가져오기
+            cursor.execute("""
+                SELECT company.symbol,
+                       SUM(CASE WHEN so.type = '매수' THEN so.quantity ELSE 0 END) -
+                       SUM(CASE WHEN so.type = '매도' THEN so.quantity ELSE 0 END) AS total_quantity,
+                       SUM(CASE WHEN so.type = '매수' THEN so.quantity * so.price ELSE 0 END) AS total_investment
+                FROM stock_order so
+                INNER JOIN company ON so.company_id = company.id
+                WHERE so.user_id = %s AND so.is_deleted = FALSE
+                GROUP BY company.symbol
+            """, (user_id,))
+            holdings = cursor.fetchall()
+
+            if not holdings:
+                yield json.dumps({"message": "No holdings found.", "roi": 0, "cash": 0, "total_investment": 0, "total_stock_value": 0, "asset_difference": 0})
+                return
+
+            # 사용자 보유 현금 가져오기
+            cursor.execute("SELECT cash FROM user_data WHERE id = %s", (user_id,))
+            user_data = cursor.fetchone()
+            cash = user_data["cash"] if user_data else 0
+
+            # Kafka 메시지 처리
+            async for msg in consumer:
+                data = msg.value
+                current_prices = {item["symbol"]: item["close"] for item in data.get("stocks", [])}
+
+                # ROI 계산
+                total_investment = 0
+                total_stock_value = 0
+                weighted_sum = 0
+                for holding in holdings:
+                    symbol = holding["symbol"]
+                    quantity = holding["total_quantity"]
+                    total_investment_for_symbol = holding["total_investment"]
+
+                    current_price = current_prices.get(symbol, 0)
+                    if quantity > 0 and total_investment_for_symbol > 0:
+                        # 종목 수익률 계산
+                        roi = ((current_price - (total_investment_for_symbol / quantity)) / 
+                               (total_investment_for_symbol / quantity)) * 100
+                        roi = round(roi, 2)
+                        weighted_sum += roi * total_investment_for_symbol
+                        total_investment += total_investment_for_symbol
+                        total_stock_value += current_price * quantity
+
+                # 포트폴리오 수익률 계산
+                if total_investment > 0:
+                    portfolio_roi = weighted_sum / total_investment
+                    portfolio_roi = round(portfolio_roi, 2)
+                else:
+                    portfolio_roi = 0
+
+                # 총자산에서 총주식 가치 차이를 계산
+                total_asset = cash + total_stock_value
+                asset_difference = total_asset - total_stock_value
+
+                # SSE 이벤트 전송
+                yield f"data: {json.dumps({'roi': portfolio_roi, 'cash': cash, 'total_investment': total_investment, 'total_stock_value': total_stock_value, 'asset_difference': asset_difference})}\n\n"
+
+        finally:
+            await consumer.stop()
+            cursor.close()
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+
+@router.get('/roi/realtime/')
+async def get_realtime_roi(request: Request, redis=Depends(get_redis)):
+    """
+    실시간 주식 종목별 수익률 SSE 엔드포인트
+    """
+    session_id = request.cookies.get("session_id")
+    if not session_id:
+        logger.critical("Session ID not found.")
+        raise HTTPException(status_code=401, detail="세션 ID가 없습니다.")
+    logger.critical("Session ID: %s", session_id)
+
+    user_id = await get_user_from_session(session_id, redis)
+    logger.critical("User ID: %s", user_id)
+
+    # Kafka Consumer 초기화
+    topic = "real_time_stock_prices"
+    group_id = f"real_time_roi_{user_id}_{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
+    consumer = await async_kafka_consumer(topic, group_id)
+    logger.critical("Kafka Consumer initialized for topic: %s, group_id: %s", topic, group_id)
+
+    async def event_stream():
+        try:
+            db = get_db_connection()
+            cursor = db.cursor(dictionary=True)
+
+            # 사용자 보유 주식 정보 가져오기
+            cursor.execute("""
+                SELECT company.symbol,
+                       SUM(CASE WHEN so.type = '매수' THEN so.quantity ELSE 0 END) -
+                       SUM(CASE WHEN so.type = '매도' THEN so.quantity ELSE 0 END) AS total_quantity,
+                       SUM(CASE WHEN so.type = '매수' THEN so.quantity * so.price ELSE 0 END) AS total_investment
+                FROM stock_order so
+                INNER JOIN company ON so.company_id = company.id
+                WHERE so.user_id = %s AND so.is_deleted = FALSE
+                GROUP BY company.symbol
+            """, (user_id,))
+            holdings = cursor.fetchall()
+            logger.critical("Holdings for User ID %s: %s", user_id, holdings)
+
+            if not holdings:
+                logger.critical("No holdings found for User ID: %s", user_id)
+                yield json.dumps({"message": "No holdings found.", "symbols": []})
+                return
+
+            # 사용자 보유 현금 가져오기
+            cursor.execute("SELECT cash FROM user_data WHERE id = %s", (user_id,))
+            user_data = cursor.fetchone()
+            cash = user_data["cash"] if user_data else 0
+            logger.critical("User ID %s, Cash: %s", user_id, cash)
+
+            # Kafka 메시지 처리
+            async for msg in consumer:
+                logger.critical("Kafka Message Received: %s", msg.value)
+                data = msg.value
+                current_prices = {item["symbol"]: item["close"] for item in data.get("stocks", [])}
+                logger.critical("Current Prices: %s", current_prices)
+
+                symbol_results = []
+                for holding in holdings:
+                    symbol = holding["symbol"]
+                    quantity = holding["total_quantity"]
+                    total_investment_for_symbol = holding["total_investment"]
+
+                    current_price = current_prices.get(symbol, 0)
+                    if quantity > 0 and total_investment_for_symbol > 0:
+                        # 종목 수익률 계산
+                        roi = ((current_price - (total_investment_for_symbol / quantity)) / 
+                               (total_investment_for_symbol / quantity)) * 100
+                        roi = round(roi, 2)
+                        total_stock_value = current_price * quantity
+                        logger.critical(
+                            "Symbol: %s, Quantity: %s, Total Investment: %s, Current Price: %s, ROI: %s, Stock Value: %s",
+                            symbol, quantity, total_investment_for_symbol, current_price, roi, total_stock_value
+                        )
+                        symbol_results.append({
+                            "symbol": symbol,
+                            "roi": roi,
+                            "cash": cash,
+                            "total_investment": total_investment_for_symbol,
+                            "total_stock_value": total_stock_value,
+                        })
+
+                # SSE 이벤트 전송 (심볼별 데이터)
+                yield f"data: {json.dumps({'symbols': symbol_results})}\n\n"
+
+        finally:
+            await consumer.stop()
+            cursor.close()
+
+    logger.critical("Starting SSE stream for User ID: %s", user_id)
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
