@@ -250,7 +250,11 @@ async def get_user_daily_roi(request: Request, redis=Depends(get_redis)):
     try:
         cursor = db.cursor()
         cursor.execute("SELECT total_roi, created_at FROM user_data WHERE id = %s", (user_id,))
-        total_roi = cursor.fetchone()
+        rows = cursor.fetchall()  # 여러 행 가져오기
+
+        # 데이터를 딕셔너리로 변환
+        total_roi = [{"roi": row[0], "date": row[1].isoformat()} for row in rows]
+
         return {"message": "일일 수익률을 조회했습니다.", "total_roi": total_roi}
     finally:
         db.close()
