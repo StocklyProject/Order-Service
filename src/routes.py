@@ -30,6 +30,7 @@ async def get_order_book_sse(symbol: str):
 @router.post("/deposit")
 async def deposit_money(request: Request, body: DepositRequest, redis=Depends(get_redis)):
     session_id = request.cookies.get("session_id")
+    logger.critical("Received session ID: %s", session_id)
     if not session_id:
         raise HTTPException(status_code=401, detail="세션 ID가 없습니다.")
     user_id = await get_user_from_session(session_id, redis)
