@@ -492,3 +492,46 @@ async def get_realtime_roi(request: Request, redis=Depends(get_redis)):
     logger.critical("Kafka Consumer initialized for topic: %s, group_id: %s", topic, group_id)
 
     return StreamingResponse(event_stream(user_id, consumer), media_type="text/event-stream")
+
+# 최신 보유 주식 수익률 조회
+@router.get('/roi/latest')
+async def get_latest_roi(request: Request, redis=Depends(get_redis)):
+    session_id = request.cookies.get("session_id")
+    if not session_id:
+        raise HTTPException(status_code=401, detail="세션 ID가 없습니다.")
+    
+    user_id = await get_user_from_session(session_id, redis)  # Redis에서 사용자 ID 조회
+    db = get_db_connection()
+    
+    try:
+        cursor = db.cursor(dictionary=True)  # 딕셔너리 형식으로 결과 반환
+        
+        # 보유 중인 주식 정보 조회
+        query = """
+            SELECT
+                co.symbol,
+                co.name,
+                so.quantity AS volume,
+                so.price AS purchase_price,
+                s.close AS current_price,
+                (s.close - so.price) AS price_difference,
+                ROUND(((s.close - so.price) / so.price) * 100, 2) AS roi,
+                s.close * so.quantity AS total_stock_prices
+            FROM stock_order AS so
+            INNER JOIN company AS co ON so.company_id = co.id
+            INNER JOIN stock AS s ON co.symbol = s.symbol
+            WHERE so.user_id = %s AND so.is_deleted = FALSE
+            AND s.date = (SELECT MAX(date) FROM stock WHERE stock.symbol = co.symbol)
+        """
+        cursor.execute(query, (user_id,))
+        results = cursor.fetchall()
+        
+        # 데이터가 없을 경우
+        if not results:
+            return {"message": "보유 중인 주식이 없습니다.", "data": []}
+        
+        # 데이터 반환
+        return {"message": "종목별 최신 수익률을 조회했습니다.", "data": results}
+    
+    finally:
+        db.close()
