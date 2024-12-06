@@ -47,6 +47,7 @@ async def deposit_money(request: Request, body: DepositRequest, redis=Depends(ge
 @router.post("/reset")
 async def reset_assets(request: Request, redis=Depends(get_redis)):
     session_id = request.cookies.get("session_id")
+    logger.critical("Received session ID: %s", session_id)
     if not session_id:
         raise HTTPException(status_code=401, detail="세션 ID가 없습니다.")
     
