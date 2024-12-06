@@ -1,7 +1,7 @@
 import mysql.connector
 import os
 import redis.asyncio as aioredis
-from logger import logger
+from .logger import logger
 
 async def get_redis():
     redis_url = os.getenv("REDIS_URL")
