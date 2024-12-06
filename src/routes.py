@@ -539,3 +539,6 @@ async def get_latest_roi(request: Request, redis=Depends(get_redis)):
     
     finally:
         db.close()
+
+# 최신 종합 주식율 조회
+@router.get('/roi/total/latest')
