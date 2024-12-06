@@ -3,3 +3,4 @@
 kafka
 zookeeper
 venv
+.venv
