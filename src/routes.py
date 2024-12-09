@@ -552,7 +552,7 @@ async def get_latest_roi(request: Request, redis=Depends(get_redis)):
     return {"message": "최식 종합 주식율 조회.", "data": latest_roi}
 
 
-# 내가 산 주식을 조회해서 매도 가능 수량 조회
+# 매도/매수 가능 수량 조회
 @router.get('/info')
 async def get_stock_info(request: Request, redis=Depends(get_redis)):
     body = await request.json()
