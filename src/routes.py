@@ -2,13 +2,14 @@ from datetime import datetime
 import pytz
 from fastapi import APIRouter, Request, Depends, HTTPException
 from fastapi.responses import StreamingResponse
-from .service import get_user_from_session, get_user_by_id, add_cash_to_user, reset_user_assets, fetch_latest_data_for_symbol, sse_event_generator, get_user_from_session, get_stocks
+from .service import get_user_by_id, add_cash_to_user, reset_user_assets, fetch_latest_data_for_symbol, sse_event_generator, get_user_from_session, get_stocks, get_latest_roi_from_session, get_stock_orders
 from .database import get_db_connection, get_redis
 from .schemas import DepositRequest, OrderRequest
 from .logger import logger
 from .consumer import async_kafka_consumer
 import json
 from decimal import Decimal
+
 
 KST = pytz.timezone('Asia/Seoul')
 
@@ -30,6 +31,7 @@ async def get_order_book_sse(symbol: str):
 @router.post("/deposit")
 async def deposit_money(request: Request, body: DepositRequest, redis=Depends(get_redis)):
     session_id = request.cookies.get("session_id")
+    logger.critical("Received session ID: %s", session_id)
     if not session_id:
         raise HTTPException(status_code=401, detail="세션 ID가 없습니다.")
     user_id = await get_user_from_session(session_id, redis)
@@ -46,6 +48,7 @@ async def deposit_money(request: Request, body: DepositRequest, redis=Depends(ge
 @router.post("/reset")
 async def reset_assets(request: Request, redis=Depends(get_redis)):
     session_id = request.cookies.get("session_id")
+    logger.critical("Received session ID: %s", session_id)
     if not session_id:
         raise HTTPException(status_code=401, detail="세션 ID가 없습니다.")
     
@@ -248,7 +251,11 @@ async def get_user_daily_roi(request: Request, redis=Depends(get_redis)):
     try:
         cursor = db.cursor()
         cursor.execute("SELECT total_roi, created_at FROM user_data WHERE id = %s", (user_id,))
-        total_roi = cursor.fetchone()
+        rows = cursor.fetchall()  # 여러 행 가져오기
+
+        # 데이터를 딕셔너리로 변환
+        total_roi = [{"roi": row[0], "date": row[1].isoformat()} for row in rows]
+
         return {"message": "일일 수익률을 조회했습니다.", "total_roi": total_roi}
     finally:
         db.close()
@@ -490,3 +497,75 @@ async def get_realtime_roi(request: Request, redis=Depends(get_redis)):
     logger.critical("Kafka Consumer initialized for topic: %s, group_id: %s", topic, group_id)
 
     return StreamingResponse(event_stream(user_id, consumer), media_type="text/event-stream")
+
+# 최신 보유 주식 수익률 조회
+@router.get('/roi/latest')
+async def get_latest_roi(request: Request, redis=Depends(get_redis)):
+    session_id = request.cookies.get("session_id")
+    if not session_id:
+        raise HTTPException(status_code=401, detail="세션 ID가 없습니다.")
+    
+    user_id = await get_user_from_session(session_id, redis)  # Redis에서 사용자 ID 조회
+    db = get_db_connection()
+    
+    try:
+        cursor = db.cursor(dictionary=True)  # 딕셔너리 형식으로 결과 반환
+        
+        # 보유 중인 주식 정보 조회
+        query = """
+            SELECT
+                co.symbol,
+                co.name,
+                so.quantity AS volume,
+                so.price AS purchase_price,
+                s.close AS current_price,
+                (s.close - so.price) AS price_difference,
+                ROUND(((s.close - so.price) / so.price) * 100, 2) AS roi,
+                s.close * so.quantity AS total_stock_prices
+            FROM stock_order AS so
+            INNER JOIN company AS co ON so.company_id = co.id
+            INNER JOIN stock AS s ON co.symbol = s.symbol
+            WHERE so.user_id = %s AND so.is_deleted = FALSE
+            AND s.date = (SELECT MAX(date) FROM stock WHERE stock.symbol = co.symbol)
+        """
+        cursor.execute(query, (user_id,))
+        results = cursor.fetchall()
+        
+        # 데이터가 없을 경우
+        if not results:
+            return {"message": "보유 중인 주식이 없습니다.", "data": []}
+        
+        # 데이터 반환
+        return {"message": "종목별 최신 수익률을 조회했습니다.", "data": results}
+    
+    finally:
+        db.close()
+
+# 최신 종합 주식율 조회
+@router.get('/roi/total/latest')
+async def get_latest_roi(request: Request, redis=Depends(get_redis)):
+    session_id = request.cookies.get("session_id")
+    if not session_id:
+        raise HTTPException(status_code=401, detail="세션 ID가 없습니다.")
+    db = get_db_connection()
+    latest_roi = await get_latest_roi_from_session(session_id, redis, db)
+    return {"message": "최식 종합 주식율 조회.", "data": latest_roi}
+
+
+# 매도/매수 가능 수량 조회
+@router.get('/info')
+async def get_stock_info(request: Request, redis=Depends(get_redis)):
+    body = await request.json()
+    symbol = body.get('symbol')
+    stock_type = body.get('type')
+
+    if not symbol or not stock_type:
+        raise HTTPException(status_code=400, detail="symbol과 type이 필요합니다.")
+
+    session_id = request.cookies.get("session_id")
+    if not session_id:
+        raise HTTPException(status_code=401, detail="세션 ID가 없습니다.")
+
+    db = get_db_connection()
+    stock_info = await get_stock_orders(session_id, symbol, stock_type, redis, db)
+    return {"message": "주식 정보 조회", "data": stock_info}

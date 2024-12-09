@@ -49,13 +49,13 @@ app.include_router(order_routes.router)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=["https://stockly-frontend.vercel.app", "http://localhost:5173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-@app.get("/")
-def hello():
-    return {"message": "order service consumer 메인페이지입니다"}
+# @app.get("/")
+# def hello():
+#     return {"message": "order service consumer 메인페이지입니다"}
