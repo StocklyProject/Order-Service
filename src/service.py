@@ -249,3 +249,145 @@ def update_daily_roi_for_all_users(db):
         logger.critical("Error calculating portfolio ROI: %s", e)
     finally:
         cursor.close()
+
+async def get_latest_roi_from_session(session_id: str, redis, db):
+    user_id = await get_user_from_session(session_id, redis)
+    try:
+        cursor = db.cursor()
+        query = """
+        SELECT 
+            total_roi, 
+            total_asset, 
+            total_stock, 
+            cash 
+        FROM 
+            user_data 
+        WHERE 
+            user_id = %s 
+            AND is_deleted = FALSE 
+        ORDER BY updated_at DESC 
+        LIMIT 1;
+        """
+        await cursor.execute(query, (user_id,))
+        result = await cursor.fetchone()
+        if not result:
+            raise HTTPException(status_code=404, detail="해당 유저의 데이터를 찾을 수 없습니다.")
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"DB 조회 중 오류가 발생했습니다: {str(e)}")
+    finally:
+        db.close()
+
+
+# 매도 가능 주식 수량을 조회하는 함수
+async def get_stock_orders(session_id: str, symbol: str, stock_type: str, redis, db):
+    user_id = await get_user_from_session(session_id, redis)
+    logger.critical(f"User ID: {user_id}")
+    try:
+        cursor = db.cursor(dictionary=True)
+        # 매수 가능한 수량 계산을 위해 종가 조회
+        if stock_type == '매수':
+            price_query = """
+                SELECT 
+                    close 
+                FROM 
+                    stock 
+                WHERE 
+                    symbol = %s 
+                    AND is_deleted = FALSE 
+                ORDER BY 
+                    date DESC 
+                LIMIT 1
+            """
+            cursor.execute(price_query, (symbol,))
+            stock_price_result = cursor.fetchone()
+
+            if stock_price_result is None:
+                logger.critical(f"No stock price found for symbol: {symbol}")
+                raise HTTPException(status_code=404, detail="주식 가격 정보를 찾을 수 없습니다.")
+
+            stock_price = int(stock_price_result.get('close', 0))
+            logger.critical(f"Stock price for {symbol}: {stock_price}")
+
+            # 사용자 자산 조회
+            asset_query = """
+                SELECT 
+                    cash 
+                FROM 
+                    user_data 
+                WHERE 
+                    user_id = %s 
+                    AND is_deleted = FALSE 
+                LIMIT 1
+            """
+            cursor.execute(asset_query, (user_id,))
+            user_data_result = cursor.fetchone()
+
+            if user_data_result is None:
+                logger.critical(f"No user data found for user_id: {user_id}")
+                raise HTTPException(status_code=404, detail="사용자 자산 정보를 찾을 수 없습니다.")
+
+            user_cash = int(user_data_result.get('cash', 0))
+            logger.critical(f"User cash: {user_cash}")
+
+            # 매수 가능 수량 = 사용자 자산 / 최신 주식 가격
+            buyable_quantity = user_cash // stock_price if stock_price > 0 else 0
+            logger.critical(f"Buyable Quantity: {buyable_quantity}")
+
+            return {
+                "symbol": symbol,
+                "stock_price": stock_price,
+                "user_cash": user_cash,
+                "buyable_quantity": buyable_quantity
+            }
+
+        # 매도 가능 수량 계산
+        elif stock_type == '매도':
+            stock_order_query = """
+                SELECT 
+                    c.id AS company_id,
+                    CAST(SUM(CASE WHEN so.type = '매수' THEN so.quantity ELSE 0 END) AS SIGNED) AS total_bought,
+                    CAST(SUM(CASE WHEN so.type = '매도' THEN so.quantity ELSE 0 END) AS SIGNED) AS total_sold
+                FROM 
+                    company c
+                INNER JOIN 
+                    stock_order so 
+                ON 
+                    so.company_id = c.id
+                WHERE 
+                    c.symbol = %s 
+                    AND c.is_deleted = FALSE 
+                    AND so.user_id = %s 
+                    AND so.is_deleted = FALSE
+                GROUP BY 
+                    c.id
+            """
+            cursor.execute(stock_order_query, (symbol, user_id))
+            result = cursor.fetchone()
+
+            logger.critical(f"Query Result: {result}")
+
+            if result is None:
+                logger.critical(f"No order data found for user_id: {user_id} and symbol: {symbol}")
+                raise HTTPException(status_code=404, detail="주문 정보를 찾을 수 없습니다.")
+
+            total_bought = int(result.get('total_bought', 0))
+            total_sold = int(result.get('total_sold', 0))
+            company_id = result.get('company_id')
+
+            logger.critical(f"Total Bought: {total_bought}, Total Sold: {total_sold}, Company ID: {company_id}")
+
+            sellable_quantity = max(total_bought - total_sold, 0)
+
+            logger.critical(f"Sellable Quantity: {sellable_quantity}")
+
+            return {
+                "symbol": symbol,
+                "company_id": company_id,
+                "total_bought": total_bought,
+                "total_sold": total_sold,
+                "sellable_quantity": sellable_quantity
+            }
+    except Exception as e:
+        logger.critical(f"Error occurred: {e}")
+        raise HTTPException(status_code=500, detail="DB 조회 중 오류가 발생했습니다.")
