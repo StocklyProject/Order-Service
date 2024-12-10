@@ -9,7 +9,8 @@ from .logger import logger
 from .consumer import async_kafka_consumer
 import json
 from decimal import Decimal
-
+import asyncio
+import mysql.connector
 
 KST = pytz.timezone('Asia/Seoul')
 
@@ -271,7 +272,12 @@ async def get_realtime_total_roi(request: Request, redis=Depends(get_redis)):
         raise HTTPException(status_code=401, detail="세션 ID가 없습니다.")
     logger.critical("Session ID: %s", session_id)
 
-    user_id = await get_user_from_session(session_id, redis)
+    try:
+        user_id = await get_user_from_session(session_id, redis)
+    except Exception as e:
+        logger.error("Failed to get user from session: %s", e)
+        raise HTTPException(status_code=401, detail="사용자를 식별할 수 없습니다.")
+
     logger.critical("User ID: %s", user_id)
 
     # Kafka Consumer 초기화
@@ -289,104 +295,83 @@ async def get_realtime_total_roi(request: Request, redis=Depends(get_redis)):
             db = get_db_connection()
             cursor = db.cursor(dictionary=True)
 
-            # 사용자 보유 현금 및 총 주식 가치 가져오기
-            cursor.execute("""
-                SELECT cash
-                FROM user_data 
-                WHERE user_id = %s
-            """, (user_id,))
-            user_data = cursor.fetchone()
+            # 사용자 현금 정보 가져오기
+            try:
+                cursor.execute("SELECT cash FROM user_data WHERE user_id = %s", (user_id,))
+                user_data = cursor.fetchone()
+            except mysql.connector.errors.InternalError as e:
+                logger.error("Failed to fetch user cash data: %s", e)
+                raise e
+
             if not user_data:
-                logger.critical("No user data found for User ID: %s", user_id)
+                logger.warning("No user data found for User ID: %s", user_id)
                 yield f"data: {json.dumps({'roi': 0, 'cash': 0, 'total_investment': 0, 'total_stock_value': 0, 'asset_difference': 0})}\n\n"
                 return
 
-            cash = user_data["cash"]
-            logger.critical("User ID %s, Cash: %s", user_id, cash)
+            cash = user_data.get("cash", 0)
 
             # 사용자 보유 주식 정보 가져오기
-            cursor.execute("""
-                SELECT company.symbol, 
-                       SUM(CASE WHEN so.type = '매수' THEN so.quantity ELSE 0 END) -
-                       SUM(CASE WHEN so.type = '매도' THEN so.quantity ELSE 0 END) AS total_quantity,
-                       SUM(CASE WHEN so.type = '매수' THEN so.quantity * so.price ELSE 0 END) AS total_investment
-                FROM stock_order so
-                INNER JOIN company ON so.company_id = company.id
-                WHERE so.user_id = %s AND so.is_deleted = FALSE
-                GROUP BY company.symbol
-            """, (user_id,))
-            holdings = cursor.fetchall()
-            logger.critical("Holdings for User ID %s: %s", user_id, holdings)
+            try:
+                cursor.execute("""
+                    SELECT company.symbol, 
+                        SUM(CASE WHEN so.type = '매수' THEN so.quantity ELSE 0 END) - 
+                        SUM(CASE WHEN so.type = '매도' THEN so.quantity ELSE 0 END) AS total_quantity,
+                        SUM(CASE WHEN so.type = '매수' THEN so.quantity * so.price ELSE 0 END) AS total_investment
+                    FROM stock_order so
+                    INNER JOIN company ON so.company_id = company.id
+                    WHERE so.user_id = %s AND so.is_deleted = FALSE
+                    GROUP BY company.symbol
+                """, (user_id,))
+                holdings = cursor.fetchall()
+            except mysql.connector.errors.InternalError as e:
+                logger.error("Failed to fetch holdings for User ID %s: %s", user_id, e)
+                raise e
 
             if not holdings:
-                logger.critical("No holdings found for User ID: %s", user_id)
                 yield f"data: {json.dumps({'roi': 0, 'cash': cash, 'total_investment': cash, 'total_stock_value': 0, 'asset_difference': cash})}\n\n"
                 return
 
-            # Kafka 메시지 처리
             async for msg in consumer:
-                logger.critical("Kafka Message Received: %s", msg.value)
-                data = msg.value
+                try:
+                    data = msg.value
+                    symbol = data.get("symbol")
+                    close_price = data.get("close")
 
-                # 최신 가격 업데이트
-                if "symbol" in data and "close" in data:
-                    current_prices[data["symbol"]] = data["close"]
-                logger.critical("Current Prices: %s", current_prices)
+                    if symbol and close_price:
+                        current_prices[symbol] = close_price
 
-                total_stock_value = 0
-                weighted_sum = 0
-                total_investment = 0
-
-                for holding in holdings:
-                    symbol = holding["symbol"]
-                    quantity = int(holding["total_quantity"])
-                    total_investment_for_symbol = float(holding["total_investment"])
-
-                    current_price = current_prices.get(symbol)
-                    if current_price is None:
-                        logger.warning("Symbol %s not found in real-time data. Skipping.", symbol)
-                        continue
-
-                    # 종목 평가 금액 계산
-                    stock_value = current_price * quantity
-                    total_stock_value += stock_value
-
-                    # 종목 수익률 계산
-                    roi = ((current_price - (total_investment_for_symbol / quantity)) /
-                           (total_investment_for_symbol / quantity)) * 100 if quantity > 0 else 0
-                    roi = round(roi, 2)
-                    weighted_sum += roi * total_investment_for_symbol
-                    total_investment += total_investment_for_symbol
-
-                    logger.critical(
-                        "Symbol: %s, Quantity: %s, Total Investment: %s, Current Price: %s, Stock Value: %s, ROI: %s",
-                        symbol, quantity, total_investment_for_symbol, current_price, stock_value, roi
+                    total_stock_value = sum(
+                        current_prices.get(holding['symbol'], 0) * holding['total_quantity']
+                        for holding in holdings
                     )
 
-                # 포트폴리오 수익률 계산
-                portfolio_roi = round((weighted_sum / total_investment), 2) if total_investment > 0 else 0
+                    total_investment = sum(holding['total_investment'] for holding in holdings)
+                    portfolio_roi = ((
+                                                 total_stock_value - total_investment) / total_investment) * 100 if total_investment > 0 else 0
+                    asset_difference = total_stock_value - total_investment
 
-                # `asset_difference`: 현재 주식 가치와 매수 시점 총 투자 금액의 차이
-                asset_difference = total_stock_value - total_investment
+                    yield f"data: {json.dumps({'roi': portfolio_roi, 'cash': cash, 'total_investment': total_investment, 'total_stock_value': total_stock_value, 'asset_difference': asset_difference})}\n\n"
 
-                logger.critical(
-                    "User ID: %s, Portfolio ROI: %s, Cash: %s, Total Investment: %s, Total Stock Value: %s, Asset Difference: %s",
-                    user_id, portfolio_roi, cash, total_investment, total_stock_value, asset_difference
-                )
+                except Exception as e:
+                    logger.error("Error while processing Kafka message: %s", e)
+                    continue
 
-                # SSE 이벤트 전송
-                yield f"data: {json.dumps({'roi': portfolio_roi, 'cash': cash, 'total_investment': total_investment, 'total_stock_value': total_stock_value, 'asset_difference': asset_difference})}\n\n"
-
+        except asyncio.CancelledError:
+            logger.warning("SSE connection cancelled by client")
+        except Exception as e:
+            logger.error("Unexpected error in event_stream: %s", e)
         finally:
-            if consumer:
-                await consumer.stop()
-            if cursor:
-                cursor.close()
-            if db:
-                db.close()
+            try:
+                if consumer:
+                    await consumer.stop()
+                if cursor:
+                    cursor.close()
+                if db:
+                    db.close()
+            except Exception as e:
+                logger.error("Error while closing resources: %s", e)
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
-
 
 
 

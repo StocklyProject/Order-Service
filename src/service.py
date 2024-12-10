@@ -268,8 +268,8 @@ async def get_latest_roi_from_session(session_id: str, redis, db):
         ORDER BY updated_at DESC 
         LIMIT 1;
         """
-        await cursor.execute(query, (user_id,))
-        result = await cursor.fetchone()
+        cursor.execute(query, (user_id,))
+        result = cursor.fetchone()
         if not result:
             raise HTTPException(status_code=404, detail="해당 유저의 데이터를 찾을 수 없습니다.")
         return result
