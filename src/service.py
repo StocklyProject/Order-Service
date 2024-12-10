@@ -250,6 +250,7 @@ def update_daily_roi_for_all_users(db):
     finally:
         cursor.close()
 
+
 async def get_latest_roi_from_session(session_id: str, redis, db):
     user_id = await get_user_from_session(session_id, redis)
     try:
@@ -270,11 +271,35 @@ async def get_latest_roi_from_session(session_id: str, redis, db):
         """
         cursor.execute(query, (user_id,))
         result = cursor.fetchone()
+
         if not result:
             raise HTTPException(status_code=404, detail="해당 유저의 데이터를 찾을 수 없습니다.")
-        return result
+
+        # DB로부터 받은 결과 매핑
+        total_roi = result[0]
+        total_asset = result[1]
+        total_stock = result[2]
+        cash = result[3]
+
+        # 데이터 계산
+        total_investment = total_asset - cash  # 총 투자 금액 (총 자산 - 현금)
+        total_stock_value = total_stock  # 주식의 총 가치
+        asset_difference = total_asset - (total_stock + cash)  # 자산 차이 (총 자산 - (주식 총 가치 + 현금))
+
+        # JSON 형태로 변환
+        result_dict = {
+            "roi": total_roi,
+            "cash": cash,
+            "total_investment": total_investment,
+            "total_stock_value": total_stock_value,
+            "asset_difference": asset_difference
+        }
+
+        return result_dict
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"DB 조회 중 오류가 발생했습니다: {str(e)}")
+
     finally:
         db.close()
 
