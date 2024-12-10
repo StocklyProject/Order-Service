@@ -343,7 +343,6 @@ async def get_realtime_total_roi(request: Request, redis=Depends(get_redis)):
                     portfolio_roi = ((total_stock_value - total_investment) / total_investment * 100) if total_investment > 0 else 0
                     asset_difference = total_stock_value - total_investment
 
-                    # 소수 둘째 자리로 반올림
                     yield f"data: {json.dumps({
                         'roi': round(portfolio_roi, 2), 
                         'cash': round(cash, 2), 
@@ -371,9 +370,20 @@ async def get_realtime_total_roi(request: Request, redis=Depends(get_redis)):
             except Exception as e:
                 logger.error("Error while closing resources: %s", e)
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+    response = StreamingResponse(event_stream(), media_type="text/event-stream")
 
+    # CORS 헤더 추가
+    allowed_origins = ["https://stockly-frontend.vercel.app", "http://localhost:5173"]
+    origin = request.headers.get("origin")
+    
+    if origin in allowed_origins:
+        response.headers["Access-Control-Allow-Origin"] = origin
+    
+    response.headers["Access-Control-Allow-Credentials"] = "true"
+    response.headers["Cache-Control"] = "no-cache"
+    response.headers["Connection"] = "keep-alive"
 
+    return response
 
 
 
@@ -483,7 +493,24 @@ async def get_realtime_roi(request: Request, redis=Depends(get_redis)):
     consumer = await async_kafka_consumer(topic, group_id)
     logger.critical("Kafka Consumer initialized for topic: %s, group_id: %s", topic, group_id)
 
-    return StreamingResponse(event_stream(user_id, consumer), media_type="text/event-stream")
+    # StreamingResponse 생성
+    response = StreamingResponse(
+        event_stream(user_id, consumer), 
+        media_type="text/event-stream"
+    )
+
+    # 요청한 출처(Origin)를 검사하여 허용된 출처만 Access-Control-Allow-Origin 헤더에 추가
+    allowed_origins = ["https://stockly-frontend.vercel.app", "http://localhost:5173"]
+    origin = request.headers.get("origin")
+    
+    if origin in allowed_origins:
+        response.headers["Access-Control-Allow-Origin"] = origin
+    
+    response.headers["Access-Control-Allow-Credentials"] = "true"
+    response.headers["Cache-Control"] = "no-cache"
+    response.headers["Connection"] = "keep-alive"
+
+    return response
 
 # 최신 보유 주식 수익률 조회
 @router.get('/roi/latest')
