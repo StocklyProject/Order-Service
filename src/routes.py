@@ -322,7 +322,7 @@ async def get_realtime_total_roi(request: Request, redis=Depends(get_redis)):
                 raise e
 
             if not holdings:
-                yield f"data: {json.dumps({'roi': 0, 'cash': cash, 'total_investment': cash, 'total_stock_value': 0, 'asset_difference': cash})}\n\n"
+                yield f"data: {json.dumps({'roi': 0, 'cash': round(cash, 2), 'total_investment': 0, 'total_stock_value': 0, 'asset_difference': round(cash, 2)})}\n\n"
                 return
 
             async for msg in consumer:
@@ -343,12 +343,13 @@ async def get_realtime_total_roi(request: Request, redis=Depends(get_redis)):
                     portfolio_roi = ((total_stock_value - total_investment) / total_investment * 100) if total_investment > 0 else 0
                     asset_difference = total_stock_value - total_investment
 
+                    # 소수 둘째 자리로 반올림
                     yield f"data: {json.dumps({
-                        'roi': float(portfolio_roi), 
-                        'cash': float(cash), 
-                        'total_investment': float(total_investment), 
-                        'total_stock_value': float(total_stock_value), 
-                        'asset_difference': float(asset_difference)
+                        'roi': round(portfolio_roi, 2), 
+                        'cash': round(cash, 2), 
+                        'total_investment': round(total_investment, 2), 
+                        'total_stock_value': round(total_stock_value, 2), 
+                        'asset_difference': round(asset_difference, 2)
                     })}\n\n"
 
                 except Exception as e:
@@ -371,6 +372,7 @@ async def get_realtime_total_roi(request: Request, redis=Depends(get_redis)):
                 logger.error("Error while closing resources: %s", e)
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
+
 
 
 
