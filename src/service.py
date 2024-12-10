@@ -311,7 +311,7 @@ async def get_stock_orders(session_id: str, symbol: str, stock_type: str, redis,
     try:
         cursor = db.cursor(dictionary=True)
         # 매수 가능한 수량 계산을 위해 종가 조회
-        if stock_type == '매수':
+        if stock_type == 'buy':
             price_query = """
                 SELECT 
                     close 
@@ -367,7 +367,7 @@ async def get_stock_orders(session_id: str, symbol: str, stock_type: str, redis,
             }
 
         # 매도 가능 수량 계산
-        elif stock_type == '매도':
+        elif stock_type == 'sell':
             stock_order_query = """
                 SELECT 
                     c.id AS company_id,
