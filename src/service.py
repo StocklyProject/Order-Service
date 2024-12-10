@@ -7,25 +7,53 @@ from .consumer import async_kafka_consumer
 from kafka import TopicPartition
 from .logger import logger
 
-# SSE 비동기 이벤트 생성기
 async def sse_event_generator(topic: str, group_id: str, symbol: str):
+    """ SSE 비동기 이벤트 생성기
+    Args:
+        topic (str): Kafka 토픽 이름
+        group_id (str): Kafka 그룹 ID
+        symbol (str): 필터링할 심볼 (종목) 이름
+    """
     consumer = await async_kafka_consumer(topic, group_id)
     try:
+        logger.info(f"Kafka 소비자 시작됨 (topic: {topic}, group_id: {group_id}, symbol: {symbol})")
+
+        # Kafka 메시지 소비 루프
         async for message in consumer:
-            # 메시지의 값을 JSON으로 파싱
             try:
-                data = json.loads(message.value) if isinstance(message.value, str) else message.value
-            except json.JSONDecodeError:
+                # 메시지를 JSON으로 파싱
+                if isinstance(message.value, (bytes, str)):
+                    data = json.loads(
+                        message.value.decode('utf-8') if isinstance(message.value, bytes) else message.value)
+                else:
+                    data = message.value
+
+                # symbol에 맞는 데이터 필터링
+                if isinstance(data, dict) and data.get("symbol") == symbol:
+                    formatted_data = json.dumps(data)
+                    yield f"data: {formatted_data}\n\n"  # 클라이언트에 데이터 전송
+                    logger.debug(f"전송된 데이터: {formatted_data}")
+
+            except json.JSONDecodeError as e:
+                logger.warning(f"JSON 파싱 오류: {e} (message: {message.value})")
+                continue
+            except Exception as e:
+                logger.error(f"메시지 처리 중 오류 발생: {e}")
                 continue
 
-            # JSON으로 파싱된 데이터에서 symbol을 확인
-            if isinstance(data, dict) and data.get("symbol") == symbol:
-                yield f"data: {json.dumps(data)}\n\n"  # 클라이언트에 데이터 전송
-
     except asyncio.CancelledError:
-        pass
+        logger.warning(f"SSE 연결 취소됨 (topic: {topic}, symbol: {symbol})")
+        raise  # 취소 요청을 재전파하여 FastAPI에 정상적으로 알림
+    except Exception as e:
+        logger.error(f"소비자 비정상 종료: {e}")
     finally:
-        await consumer.stop()
+        # 커넥션 종료 보장
+        if consumer is not None:
+            try:
+                await consumer.stop()
+                logger.info(f"Kafka 소비자 종료됨 (topic: {topic}, group_id: {group_id})")
+            except Exception as e:
+                logger.error(f"Kafka 소비자 종료 중 오류 발생: {e}")
 
 async def get_user_from_session(session_id: str, redis):
     user_id_bytes = await redis.get(session_id)

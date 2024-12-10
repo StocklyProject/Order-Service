@@ -543,6 +543,9 @@ async def get_stock_info(request: Request, symbol: str = Query, type: str = Quer
     if not symbol or not type:
         raise HTTPException(status_code=400, detail="symbol과 type이 필요합니다.")
 
+    if type not in ['buy', 'sell']:
+        raise HTTPException(status_code=400, detail="잘못된 type 값입니다.")
+
     session_id = request.cookies.get("session_id")
     if not session_id:
         raise HTTPException(status_code=401, detail="세션 ID가 없습니다.")
