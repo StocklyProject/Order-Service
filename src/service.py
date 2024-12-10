@@ -334,10 +334,14 @@ async def get_latest_roi_from_session(session_id: str, redis, db):
 
 # 매도 가능 주식 수량을 조회하는 함수
 async def get_stock_orders(session_id: str, symbol: str, stock_type: str, redis, db):
-    user_id = await get_user_from_session(session_id, redis)
-    logger.critical(f"User ID: {user_id}")
+    logger.critical(f"get_stock_orders called with session_id: {session_id}, symbol: {symbol}, stock_type: {stock_type}")
     try:
+        user_id = await get_user_from_session(session_id, redis)
+        logger.critical(f"User ID retrieved from session: {user_id}")
+        
         cursor = db.cursor(dictionary=True)
+        logger.critical("Database cursor created successfully")
+
         # 매수 가능한 수량 계산을 위해 종가 조회
         if stock_type == 'buy':
             price_query = """
@@ -354,6 +358,7 @@ async def get_stock_orders(session_id: str, symbol: str, stock_type: str, redis,
             """
             cursor.execute(price_query, (symbol,))
             stock_price_result = cursor.fetchone()
+            logger.critical(f"Stock price query result: {stock_price_result}")
 
             if stock_price_result is None:
                 logger.critical(f"No stock price found for symbol: {symbol}")
@@ -375,17 +380,18 @@ async def get_stock_orders(session_id: str, symbol: str, stock_type: str, redis,
             """
             cursor.execute(asset_query, (user_id,))
             user_data_result = cursor.fetchone()
+            logger.critical(f"User asset query result: {user_data_result}")
 
             if user_data_result is None:
                 logger.critical(f"No user data found for user_id: {user_id}")
                 raise HTTPException(status_code=404, detail="사용자 자산 정보를 찾을 수 없습니다.")
 
             user_cash = int(user_data_result.get('cash', 0))
-            logger.critical(f"User cash: {user_cash}")
+            logger.critical(f"User cash for user_id {user_id}: {user_cash}")
 
             # 매수 가능 수량 = 사용자 자산 / 최신 주식 가격
             buyable_quantity = user_cash // stock_price if stock_price > 0 else 0
-            logger.critical(f"Buyable Quantity: {buyable_quantity}")
+            logger.critical(f"Calculated buyable quantity: {buyable_quantity}")
 
             return {
                 "symbol": symbol,
@@ -417,8 +423,7 @@ async def get_stock_orders(session_id: str, symbol: str, stock_type: str, redis,
             """
             cursor.execute(stock_order_query, (symbol, user_id))
             result = cursor.fetchone()
-
-            logger.critical(f"Query Result: {result}")
+            logger.critical(f"Stock order query result: {result}")
 
             if result is None:
                 logger.critical(f"No order data found for user_id: {user_id} and symbol: {symbol}")
@@ -427,12 +432,10 @@ async def get_stock_orders(session_id: str, symbol: str, stock_type: str, redis,
             total_bought = int(result.get('total_bought', 0))
             total_sold = int(result.get('total_sold', 0))
             company_id = result.get('company_id')
-
-            logger.critical(f"Total Bought: {total_bought}, Total Sold: {total_sold}, Company ID: {company_id}")
+            logger.critical(f"Total bought: {total_bought}, Total sold: {total_sold}, Company ID: {company_id}")
 
             sellable_quantity = max(total_bought - total_sold, 0)
-
-            logger.critical(f"Sellable Quantity: {sellable_quantity}")
+            logger.critical(f"Calculated sellable quantity: {sellable_quantity}")
 
             return {
                 "symbol": symbol,
@@ -442,5 +445,12 @@ async def get_stock_orders(session_id: str, symbol: str, stock_type: str, redis,
                 "sellable_quantity": sellable_quantity
             }
     except Exception as e:
-        logger.critical(f"Error occurred: {e}")
+        logger.critical(f"Error occurred while processing get_stock_orders: {e}")
         raise HTTPException(status_code=500, detail="DB 조회 중 오류가 발생했습니다.")
+    finally:
+        if cursor:
+            cursor.close()
+            logger.critical("Database cursor closed")
+        if db:
+            db.close()
+            logger.critical("Database connection closed")

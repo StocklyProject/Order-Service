@@ -540,16 +540,26 @@ async def get_latest_roi(request: Request, redis=Depends(get_redis)):
 # 매도/매수 가능 수량 조회
 @router.get('/info')
 async def get_stock_info(request: Request, symbol: str = Query, type: str = Query, redis=Depends(get_redis)):
+    logger.critical(f"Request received for get_stock_info with symbol: {symbol}, type: {type}")
     if not symbol or not type:
+        logger.critical("Missing required parameters: symbol or type")
         raise HTTPException(status_code=400, detail="symbol과 type이 필요합니다.")
 
     if type not in ['buy', 'sell']:
+        logger.critical(f"Invalid type value: {type}")
         raise HTTPException(status_code=400, detail="잘못된 type 값입니다.")
 
     session_id = request.cookies.get("session_id")
     if not session_id:
+        logger.critical("Missing session ID in request cookies")
         raise HTTPException(status_code=401, detail="세션 ID가 없습니다.")
 
-    db = get_db_connection()
-    stock_info = await get_stock_orders(session_id, symbol, type, redis, db)
-    return {"message": "주식 정보 조회", "data": stock_info}
+    try:
+        db = get_db_connection()
+        logger.critical("Database connection established successfully")
+        stock_info = await get_stock_orders(session_id, symbol, type, redis, db)
+        logger.critical(f"Successfully retrieved stock info: {stock_info}")
+        return {"message": "주식 정보 조회", "data": stock_info}
+    except Exception as e:
+        logger.critical(f"Unexpected error in get_stock_info: {e}")
+        raise HTTPException(status_code=500, detail="서버 내부 오류가 발생했습니다.")
