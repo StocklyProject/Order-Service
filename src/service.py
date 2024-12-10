@@ -425,9 +425,16 @@ async def get_stock_orders(session_id: str, symbol: str, stock_type: str, redis,
             result = cursor.fetchone()
             logger.critical(f"Stock order query result: {result}")
 
+            # 결과가 없으면 매도 가능 수량을 0으로 설정
             if result is None:
                 logger.critical(f"No order data found for user_id: {user_id} and symbol: {symbol}")
-                raise HTTPException(status_code=404, detail="주문 정보를 찾을 수 없습니다.")
+                return {
+                    "symbol": symbol,
+                    "company_id": None,
+                    "total_bought": 0,
+                    "total_sold": 0,
+                    "sellable_quantity": 0
+                }
 
             total_bought = int(result.get('total_bought', 0))
             total_sold = int(result.get('total_sold', 0))
@@ -453,4 +460,4 @@ async def get_stock_orders(session_id: str, symbol: str, stock_type: str, redis,
             logger.critical("Database cursor closed")
         if db:
             db.close()
-            logger.critical("Database connection closed")
+            logger.critical("Database connection closed") 
