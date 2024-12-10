@@ -1,6 +1,6 @@
 from datetime import datetime
 import pytz
-from fastapi import APIRouter, Request, Depends, HTTPException
+from fastapi import APIRouter, Request, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from .service import get_user_by_id, add_cash_to_user, reset_user_assets, fetch_latest_data_for_symbol, sse_event_generator, get_user_from_session, get_stocks, get_latest_roi_from_session, get_stock_orders
 from .database import get_db_connection, get_redis
@@ -539,12 +539,8 @@ async def get_latest_roi(request: Request, redis=Depends(get_redis)):
 
 # 매도/매수 가능 수량 조회
 @router.get('/info')
-async def get_stock_info(request: Request, redis=Depends(get_redis)):
-    body = await request.json()
-    symbol = body.get('symbol')
-    stock_type = body.get('type')
-
-    if not symbol or not stock_type:
+async def get_stock_info(request: Request, symbol: str = Query, type: str = Query, redis=Depends(get_redis)):
+    if not symbol or not type:
         raise HTTPException(status_code=400, detail="symbol과 type이 필요합니다.")
 
     session_id = request.cookies.get("session_id")
@@ -552,5 +548,5 @@ async def get_stock_info(request: Request, redis=Depends(get_redis)):
         raise HTTPException(status_code=401, detail="세션 ID가 없습니다.")
 
     db = get_db_connection()
-    stock_info = await get_stock_orders(session_id, symbol, stock_type, redis, db)
+    stock_info = await get_stock_orders(session_id, symbol, type, redis, db)
     return {"message": "주식 정보 조회", "data": stock_info}
