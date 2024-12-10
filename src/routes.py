@@ -264,9 +264,6 @@ async def get_user_daily_roi(request: Request, redis=Depends(get_redis)):
 
 @router.get('/roi/realtime/total')
 async def get_realtime_total_roi(request: Request, redis=Depends(get_redis)):
-    """
-    실시간 종합 주식 수익률 SSE 엔드포인트
-    """
     session_id = request.cookies.get("session_id")
     if not session_id:
         raise HTTPException(status_code=401, detail="세션 ID가 없습니다.")
@@ -280,7 +277,6 @@ async def get_realtime_total_roi(request: Request, redis=Depends(get_redis)):
 
     logger.critical("User ID: %s", user_id)
 
-    # Kafka Consumer 초기화
     topic = "real_time_stock_prices"
     group_id = f"real_time_total_roi_{user_id}_{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
     consumer = await async_kafka_consumer(topic, group_id)
@@ -295,7 +291,6 @@ async def get_realtime_total_roi(request: Request, redis=Depends(get_redis)):
             db = get_db_connection()
             cursor = db.cursor(dictionary=True)
 
-            # 사용자 현금 정보 가져오기
             try:
                 cursor.execute("SELECT cash FROM user_data WHERE user_id = %s", (user_id,))
                 user_data = cursor.fetchone()
@@ -308,9 +303,8 @@ async def get_realtime_total_roi(request: Request, redis=Depends(get_redis)):
                 yield f"data: {json.dumps({'roi': 0, 'cash': 0, 'total_investment': 0, 'total_stock_value': 0, 'asset_difference': 0})}\n\n"
                 return
 
-            cash = user_data.get("cash", 0)
+            cash = float(user_data.get("cash", 0))
 
-            # 사용자 보유 주식 정보 가져오기
             try:
                 cursor.execute("""
                     SELECT company.symbol, 
@@ -335,22 +329,27 @@ async def get_realtime_total_roi(request: Request, redis=Depends(get_redis)):
                 try:
                     data = msg.value
                     symbol = data.get("symbol")
-                    close_price = data.get("close")
+                    close_price = float(data.get("close", 0))
 
                     if symbol and close_price:
                         current_prices[symbol] = close_price
 
                     total_stock_value = sum(
-                        current_prices.get(holding['symbol'], 0) * holding['total_quantity']
+                        float(current_prices.get(holding['symbol'], 0)) * float(holding['total_quantity'])
                         for holding in holdings
                     )
 
-                    total_investment = sum(holding['total_investment'] for holding in holdings)
-                    portfolio_roi = ((
-                                                 total_stock_value - total_investment) / total_investment) * 100 if total_investment > 0 else 0
+                    total_investment = sum(float(holding['total_investment']) for holding in holdings)
+                    portfolio_roi = ((total_stock_value - total_investment) / total_investment * 100) if total_investment > 0 else 0
                     asset_difference = total_stock_value - total_investment
 
-                    yield f"data: {json.dumps({'roi': portfolio_roi, 'cash': cash, 'total_investment': total_investment, 'total_stock_value': total_stock_value, 'asset_difference': asset_difference})}\n\n"
+                    yield f"data: {json.dumps({
+                        'roi': float(portfolio_roi), 
+                        'cash': float(cash), 
+                        'total_investment': float(total_investment), 
+                        'total_stock_value': float(total_stock_value), 
+                        'asset_difference': float(asset_difference)
+                    })}\n\n"
 
                 except Exception as e:
                     logger.error("Error while processing Kafka message: %s", e)
@@ -372,6 +371,7 @@ async def get_realtime_total_roi(request: Request, redis=Depends(get_redis)):
                 logger.error("Error while closing resources: %s", e)
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
+
 
 
 
