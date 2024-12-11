@@ -310,7 +310,7 @@ async def get_realtime_total_roi(request: Request, redis=Depends(get_redis)):
                     SELECT company.symbol, 
                         SUM(CASE WHEN so.type = '매수' THEN so.quantity ELSE 0 END) - 
                         SUM(CASE WHEN so.type = '매도' THEN so.quantity ELSE 0 END) AS total_quantity,
-                        SUM(CASE WHEN so.type = '매수' THEN so.quantity * so.price ELSE 0 END) AS total_investment
+                        SUM(CASE WHEN so.type = '매수' THEN so.quantity * so.price ELSE 0 END) / NULLIF(SUM(CASE WHEN so.type = '매수' THEN so.quantity ELSE 0 END), 0) AS average_buy_price
                     FROM stock_order so
                     INNER JOIN company ON so.company_id = company.id
                     WHERE so.user_id = %s AND so.is_deleted = FALSE
@@ -334,22 +334,29 @@ async def get_realtime_total_roi(request: Request, redis=Depends(get_redis)):
                     if symbol and close_price:
                         current_prices[symbol] = close_price
 
+                    # 🛠️ 보유 주식의 총 매수 금액을 계산 (total_quantity * average_buy_price)
+                    total_investment = sum(
+                        float(holding['total_quantity']) * float(holding['average_buy_price'])
+                        for holding in holdings
+                    )
+
+                    # 🛠️ 보유 주식의 현재 시장 가치를 계산
                     total_stock_value = sum(
                         float(current_prices.get(holding['symbol'], 0)) * float(holding['total_quantity'])
                         for holding in holdings
                     )
 
-                    total_investment = sum(float(holding['total_investment']) for holding in holdings)
-                    portfolio_roi = ((total_stock_value - total_investment) / total_investment * 100) if total_investment > 0 else 0
+                    portfolio_roi = ((
+                                                 total_stock_value - total_investment) / total_investment * 100) if total_investment > 0 else 0
                     asset_difference = total_stock_value - total_investment
 
                     yield f"data: {json.dumps({
-                        'roi': round(portfolio_roi, 2), 
-                        'cash': round(cash, 2), 
-                        'total_investment': round(total_investment, 2), 
-                        'total_stock_value': round(total_stock_value, 2), 
+                        'roi': round(portfolio_roi, 2),
+                        'cash': round(cash, 2),
+                        'total_investment': round(total_investment, 2),
+                        'total_stock_value': round(total_stock_value, 2),
                         'asset_difference': round(asset_difference, 2),
-                        'total_asset': round(cash + total_stock_value, 2)  # 총자산 추가
+                        'total_asset': round(cash + total_stock_value, 2)
                     })}\n\n"
 
                 except Exception as e:

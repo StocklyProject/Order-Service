@@ -283,12 +283,13 @@ async def get_latest_roi_from_session(session_id: str, redis, db):
     user_id = await get_user_from_session(session_id, redis)
     try:
         cursor = db.cursor()
+
+        # 🔥 1️⃣ user_data 테이블에서 기본 정보 가져오기
         query = """
         SELECT 
             total_roi, 
-            total_asset, 
-            total_stock, 
-            cash 
+            total_stock, -- 보유 주식의 총 시세 (현재 시장 가치)
+            cash -- 보유 현금
         FROM 
             user_data 
         WHERE 
@@ -304,29 +305,49 @@ async def get_latest_roi_from_session(session_id: str, redis, db):
             raise HTTPException(status_code=404, detail="해당 유저의 데이터를 찾을 수 없습니다.")
 
         # DB로부터 받은 결과 매핑
-        total_roi = result[0]
-        total_asset = result[1]
-        total_stock = result[2]
-        cash = result[3]
+        total_roi = float(result[0])  # 수익률
+        total_stock_value = float(result[1])  # 현재 보유 중인 주식의 총 시세
+        cash = float(result[2])  # 보유 현금
 
-        # 데이터 계산
-        total_investment = total_asset - cash  # 총 투자 금액 (총 자산 - 현금)
-        total_stock_value = total_stock  # 주식의 총 가치
-        asset_difference = total_investment - total_stock  # 투자 금액 - 주식 가치
+        # 🔥 2️⃣ 보유 주식의 총 매수 금액 (total_investment) 계산
+        try:
+            cursor.execute("""
+            SELECT 
+                SUM((so.quantity - IFNULL(sq.sold_quantity, 0)) * so.price) AS total_investment 
+            FROM stock_order so 
+            LEFT JOIN (
+                SELECT so2.company_id, SUM(so2.quantity) AS sold_quantity 
+                FROM stock_order so2 
+                WHERE so2.user_id = %s AND so2.type = '매도' AND so2.is_deleted = FALSE 
+                GROUP BY so2.company_id
+            ) sq ON so.company_id = sq.company_id 
+            WHERE so.user_id = %s AND so.type = '매수' AND so.is_deleted = FALSE;
+            """, (user_id, user_id))
+            total_investment = cursor.fetchone()[0] or 0  # 총 투자 금액 (현재 보유 주식의 매수 원가 총합)
+        except Exception as e:
+            logger.error("Failed to fetch total investment for User ID %s: %s", user_id, e)
+            total_investment = 0
 
-        # JSON 형태로 변환
+        # 🔥 3️⃣ 자산 차이(asset_difference) 계산
+        asset_difference = total_stock_value - total_investment  # 주식 자산 - 투자 금액
+
+        # 🔥 4️⃣ 총 자산(total_asset) 계산
+        total_asset = cash + total_stock_value  # 총 자산 = 현금 + 주식의 현재 시세
+
+        # 🔥 5️⃣ JSON 형태로 변환 (최종 반환 값)
         result_dict = {
-            "roi": total_roi,
-            "cash": cash,
-            "total_investment": total_investment, # 총 투자 금액
-            "total_stock_value": total_stock_value, # 주식의 총 가치
-            "asset_difference": asset_difference, # 자산 차
-            "total_asset": cash + total_stock_value,
+            "roi": round(total_roi, 2),  # 수익률
+            "cash": round(cash, 2),  # 보유 현금
+            "total_investment": round(total_investment, 2),  # 총 투자 금액 (보유 주식의 매수 원가 총합)
+            "total_stock_value": round(total_stock_value, 2),  # 주식의 총 시세 (현재 시장 가치)
+            "asset_difference": round(asset_difference, 2),  # 자산 차이 (주식 자산 - 투자 금액)
+            "total_asset": round(total_asset, 2)  # 총 자산 (현금 + 주식의 총 시세)
         }
 
         return result_dict
 
     except Exception as e:
+        logger.error("Error fetching ROI for User ID %s: %s", user_id, e)
         raise HTTPException(status_code=500, detail=f"DB 조회 중 오류가 발생했습니다: {str(e)}")
 
     finally:
