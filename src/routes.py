@@ -1,6 +1,6 @@
 from datetime import datetime
 import pytz
-from fastapi import APIRouter, Request, Depends, HTTPException
+from fastapi import APIRouter, Request, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from .service import get_user_by_id, add_cash_to_user, reset_user_assets, fetch_latest_data_for_symbol, sse_event_generator, get_user_from_session, get_stocks, get_latest_roi_from_session, get_stock_orders
 from .database import get_db_connection, get_redis
@@ -9,7 +9,8 @@ from .logger import logger
 from .consumer import async_kafka_consumer
 import json
 from decimal import Decimal
-
+import asyncio
+import mysql.connector
 
 KST = pytz.timezone('Asia/Seoul')
 
@@ -78,21 +79,23 @@ async def process_order(
     # 사용자 ID 가져오기
     user_id = await get_user_from_session(session_id, redis)
 
-    cursor = db.cursor(dictionary=True)
+    cursor = db.cursor(dictionary=True, buffered=True)  # 🔥 buffered=True 추가
 
     try:
         db.autocommit = False
 
         # 회사 정보 조회
-        cursor.execute("SELECT id FROM company WHERE symbol = %s", (body.symbol,))
+        cursor.execute("SELECT id FROM company WHERE symbol = %s LIMIT 1", (body.symbol,))  # 🔥 LIMIT 1 추가
         company_data = cursor.fetchone()
+        cursor.nextset()  # 🔥 추가된 nextset()으로 미소진 결과 집합 소진
         if not company_data:
             raise HTTPException(status_code=404, detail=f"심볼 '{body.symbol}'에 해당하는 회사가 없습니다.")
         company_id = company_data["id"]
 
         # 사용자 자산 정보 조회
-        cursor.execute("SELECT cash FROM user_data WHERE user_id = %s", (user_id,))
+        cursor.execute("SELECT cash FROM user_data WHERE user_id = %s LIMIT 1", (user_id,))  # 🔥 LIMIT 1 추가
         user_data = cursor.fetchone()
+        cursor.nextset()
         if not user_data:
             raise HTTPException(status_code=404, detail="사용자 정보를 찾을 수 없습니다.")
         user_cash = user_data["cash"]
@@ -150,6 +153,7 @@ async def process_order(
                 (user_id, company_id),
             )
             user_stock_quantity = cursor.fetchone()["total_quantity"]
+            cursor.nextset()
 
             if user_stock_quantity < body.quantity:
                 raise HTTPException(status_code=400, detail="보유 주식 수량이 부족하여 매도할 수 없습니다.")
@@ -187,24 +191,6 @@ async def process_order(
                 order_status,
             ),
         )
-
-        # 자산 데이터 갱신
-        if order_status == "체결":
-            cursor.execute(
-                """
-                UPDATE user_data
-                SET cash = %s, 
-                    total_stock = (
-                        SELECT 
-                            IFNULL(SUM(price * quantity), 0) 
-                        FROM stock_order 
-                        WHERE user_id = %s AND type = '매수' AND is_deleted = 0
-                    ),
-                    total_asset = cash + total_stock
-                WHERE user_id = %s
-                """,
-                (user_cash, user_id, user_id),
-            )
 
         db.commit()
 
@@ -263,18 +249,19 @@ async def get_user_daily_roi(request: Request, redis=Depends(get_redis)):
 
 @router.get('/roi/realtime/total')
 async def get_realtime_total_roi(request: Request, redis=Depends(get_redis)):
-    """
-    실시간 종합 주식 수익률 SSE 엔드포인트
-    """
     session_id = request.cookies.get("session_id")
     if not session_id:
         raise HTTPException(status_code=401, detail="세션 ID가 없습니다.")
     logger.critical("Session ID: %s", session_id)
 
-    user_id = await get_user_from_session(session_id, redis)
+    try:
+        user_id = await get_user_from_session(session_id, redis)
+    except Exception as e:
+        logger.error("Failed to get user from session: %s", e)
+        raise HTTPException(status_code=401, detail="사용자를 식별할 수 없습니다.")
+
     logger.critical("User ID: %s", user_id)
 
-    # Kafka Consumer 초기화
     topic = "real_time_stock_prices"
     group_id = f"real_time_total_roi_{user_id}_{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
     consumer = await async_kafka_consumer(topic, group_id)
@@ -287,108 +274,84 @@ async def get_realtime_total_roi(request: Request, redis=Depends(get_redis)):
 
         try:
             db = get_db_connection()
-            cursor = db.cursor(dictionary=True)
+            cursor = db.cursor(dictionary=True, buffered=True)  # 🔥 buffered=True 추가
 
-            # 사용자 보유 현금 및 총 주식 가치 가져오기
-            cursor.execute("""
-                SELECT cash
-                FROM user_data 
-                WHERE user_id = %s
-            """, (user_id,))
-            user_data = cursor.fetchone()
+            try:
+                cursor.execute("SELECT cash FROM user_data WHERE user_id = %s LIMIT 1", (user_id,))  # 🔥 LIMIT 1 추가
+                user_data = cursor.fetchone()
+                cursor.nextset()  # 🔥 추가된 nextset()으로 미소진 결과 집합 소진
+            except mysql.connector.errors.InternalError as e:
+                logger.error("Failed to fetch user cash data: %s", e)
+                raise e
+
             if not user_data:
-                logger.critical("No user data found for User ID: %s", user_id)
+                logger.warning("No user data found for User ID: %s", user_id)
                 yield f"data: {json.dumps({'roi': 0, 'cash': 0, 'total_investment': 0, 'total_stock_value': 0, 'asset_difference': 0})}\n\n"
                 return
 
-            cash = user_data["cash"]
-            logger.critical("User ID %s, Cash: %s", user_id, cash)
+            cash = float(user_data.get("cash", 0))
 
-            # 사용자 보유 주식 정보 가져오기
-            cursor.execute("""
-                SELECT company.symbol, 
-                       SUM(CASE WHEN so.type = '매수' THEN so.quantity ELSE 0 END) -
-                       SUM(CASE WHEN so.type = '매도' THEN so.quantity ELSE 0 END) AS total_quantity,
-                       SUM(CASE WHEN so.type = '매수' THEN so.quantity * so.price ELSE 0 END) AS total_investment
-                FROM stock_order so
-                INNER JOIN company ON so.company_id = company.id
-                WHERE so.user_id = %s AND so.is_deleted = FALSE
-                GROUP BY company.symbol
-            """, (user_id,))
-            holdings = cursor.fetchall()
-            logger.critical("Holdings for User ID %s: %s", user_id, holdings)
+            try:
+                cursor.execute("""
+                    SELECT company.symbol, 
+                        SUM(CASE WHEN so.type = '매수' THEN so.quantity ELSE 0 END) - 
+                        SUM(CASE WHEN so.type = '매도' THEN so.quantity ELSE 0 END) AS total_quantity,
+                        SUM(CASE WHEN so.type = '매수' THEN so.quantity * so.price ELSE 0 END) / NULLIF(SUM(CASE WHEN so.type = '매수' THEN so.quantity ELSE 0 END), 0) AS average_buy_price
+                    FROM stock_order so
+                    INNER JOIN company ON so.company_id = company.id
+                    WHERE so.user_id = %s AND so.is_deleted = FALSE
+                    GROUP BY company.symbol
+                """, (user_id,))
+                holdings = cursor.fetchall()
+            except mysql.connector.errors.InternalError as e:
+                logger.error("Failed to fetch holdings for User ID %s: %s", user_id, e)
+                raise e
 
-            if not holdings:
-                logger.critical("No holdings found for User ID: %s", user_id)
-                yield f"data: {json.dumps({'roi': 0, 'cash': cash, 'total_investment': cash, 'total_stock_value': 0, 'asset_difference': cash})}\n\n"
-                return
-
-            # Kafka 메시지 처리
             async for msg in consumer:
-                logger.critical("Kafka Message Received: %s", msg.value)
-                data = msg.value
+                try:
+                    data = msg.value
+                    symbol = data.get("symbol")
+                    close_price = float(data.get("close", 0))
 
-                # 최신 가격 업데이트
-                if "symbol" in data and "close" in data:
-                    current_prices[data["symbol"]] = data["close"]
-                logger.critical("Current Prices: %s", current_prices)
+                    if symbol and close_price:
+                        current_prices[symbol] = close_price
 
-                total_stock_value = 0
-                weighted_sum = 0
-                total_investment = 0
-
-                for holding in holdings:
-                    symbol = holding["symbol"]
-                    quantity = int(holding["total_quantity"])
-                    total_investment_for_symbol = float(holding["total_investment"])
-
-                    current_price = current_prices.get(symbol)
-                    if current_price is None:
-                        logger.warning("Symbol %s not found in real-time data. Skipping.", symbol)
-                        continue
-
-                    # 종목 평가 금액 계산
-                    stock_value = current_price * quantity
-                    total_stock_value += stock_value
-
-                    # 종목 수익률 계산
-                    roi = ((current_price - (total_investment_for_symbol / quantity)) /
-                           (total_investment_for_symbol / quantity)) * 100 if quantity > 0 else 0
-                    roi = round(roi, 2)
-                    weighted_sum += roi * total_investment_for_symbol
-                    total_investment += total_investment_for_symbol
-
-                    logger.critical(
-                        "Symbol: %s, Quantity: %s, Total Investment: %s, Current Price: %s, Stock Value: %s, ROI: %s",
-                        symbol, quantity, total_investment_for_symbol, current_price, stock_value, roi
+                    total_investment = sum(
+                        float(holding['total_quantity']) * float(holding['average_buy_price'])
+                        for holding in holdings
                     )
 
-                # 포트폴리오 수익률 계산
-                portfolio_roi = round((weighted_sum / total_investment), 2) if total_investment > 0 else 0
+                    total_stock_value = sum(
+                        float(current_prices.get(holding['symbol'], 0)) * float(holding['total_quantity'])
+                        for holding in holdings
+                    )
 
-                # `asset_difference`: 현재 주식 가치와 매수 시점 총 투자 금액의 차이
-                asset_difference = total_stock_value - total_investment
+                    portfolio_roi = ((total_stock_value - total_investment) / total_investment * 100) if total_investment > 0 else 0
+                    asset_difference = total_stock_value - total_investment
 
-                logger.critical(
-                    "User ID: %s, Portfolio ROI: %s, Cash: %s, Total Investment: %s, Total Stock Value: %s, Asset Difference: %s",
-                    user_id, portfolio_roi, cash, total_investment, total_stock_value, asset_difference
-                )
+                    yield f"data: {json.dumps({'roi': round(portfolio_roi, 2), 'cash': round(cash, 2), 'total_investment': round(total_investment, 2), 'total_stock_value': round(total_stock_value, 2), 'asset_difference': round(asset_difference, 2), 'total_asset': round(cash + total_stock_value, 2)})}\n\n"
 
-                # SSE 이벤트 전송
-                yield f"data: {json.dumps({'roi': portfolio_roi, 'cash': cash, 'total_investment': total_investment, 'total_stock_value': total_stock_value, 'asset_difference': asset_difference})}\n\n"
+                except Exception as e:
+                    logger.error("Error while processing Kafka message: %s", e)
+                    continue
 
+        except asyncio.CancelledError:
+            logger.warning("SSE connection cancelled by client")
+        except Exception as e:
+            logger.error("Unexpected error in event_stream: %s", e)
         finally:
-            if consumer:
-                await consumer.stop()
-            if cursor:
-                cursor.close()
-            if db:
-                db.close()
+            try:
+                if consumer:
+                    await consumer.stop()
+                if cursor:
+                    cursor.close()  # 🔥 커서 닫기 추가
+                if db:
+                    db.close()
+            except Exception as e:
+                logger.error("Error while closing resources: %s", e)
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
-
-
-
+    response = StreamingResponse(event_stream(), media_type="text/event-stream")
+    return response
 
 def decimal_encoder(obj):
     if isinstance(obj, Decimal):
@@ -402,7 +365,6 @@ async def event_stream(user_id, consumer):
         db = get_db_connection()
         cursor = db.cursor(dictionary=True)
 
-        # 사용자 보유 주식 정보 가져오기
         cursor.execute("""
             SELECT company.symbol, company.name,
                    SUM(CASE WHEN so.type = '매수' THEN so.quantity ELSE 0 END) -
@@ -414,57 +376,38 @@ async def event_stream(user_id, consumer):
             GROUP BY company.symbol, company.name
         """, (user_id,))
         holdings = cursor.fetchall()
-        logger.critical("Holdings for User ID %s: %s", user_id, holdings)
 
-        if not holdings:
-            logger.critical("No holdings found for User ID: %s", user_id)
-            yield f"data: {json.dumps({'message': 'No holdings found.'}, default=decimal_encoder)}\n\n"
-            return
+        holdings_dict = {holding["symbol"]: holding for holding in holdings}
 
-        # 사용자 보유 현금 가져오기
         cursor.execute("SELECT cash FROM user_data WHERE id = %s", (user_id,))
         user_data = cursor.fetchone()
         cash = user_data["cash"] if user_data else 0
-        logger.critical("User ID %s, Cash: %s", user_id, cash)
 
-        # Kafka 메시지 처리
+        last_prices = {}
+
         async for msg in consumer:
-            logger.critical("Kafka Message Received: %s", msg.value)
             data = msg.value
+            symbol = data.get("symbol")
+            current_price = data.get("close")
 
-            # 실시간 가격 데이터 매핑
-            current_prices = {data["symbol"]: data["close"]} if "symbol" in data and "close" in data else {}
-            logger.critical("Current Prices: %s", current_prices)
+            if symbol and current_price:
+                if last_prices.get(symbol) == current_price:
+                    continue  # 🔥 중복 가격 필터링
+                last_prices[symbol] = current_price
 
-            for holding in holdings:
-                symbol = holding["symbol"]
-                name = holding["name"]
-                quantity = float(holding["total_quantity"])  # Decimal -> float
-                total_investment_for_symbol = float(holding["total_investment"])  # Decimal -> float
-
-                # 현재 심볼에 해당하는 실시간 가격 가져오기
-                current_price = current_prices.get(symbol, 0.0)
-                if current_price == 0.0:
-                    logger.warning("Symbol %s not found or price is 0 in real-time data.", symbol)
+                holding = holdings_dict.get(symbol)
+                if not holding:
                     continue
 
-                # 종목 수익률 및 평가 금액 계산
+                name = holding["name"]
+                quantity = float(holding["total_quantity"])
+                total_investment_for_symbol = float(holding["total_investment"])
                 total_stock_value = current_price * quantity
-                roi = ((current_price - (total_investment_for_symbol / quantity)) / 
-                       (total_investment_for_symbol / quantity)) * 100 if quantity > 0 else 0
-                roi = round(roi, 2)
-
-                # 현재 가격 - 평균 매수 가격 계산
                 avg_buy_price = total_investment_for_symbol / quantity if quantity > 0 else 0
+                roi = ((current_price - avg_buy_price) / avg_buy_price) * 100 if avg_buy_price > 0 else 0
                 price_difference = current_price - avg_buy_price
 
-                logger.critical(
-                    "Symbol: %s, Name: %s, Quantity: %s, Total Investment: %s, Current Price: %s, ROI: %s, Stock Value: %s, Price Diff: %s",
-                    symbol, name, quantity, total_investment_for_symbol, current_price, roi, total_stock_value, price_difference
-                )
-
-                # 단일 객체로 반환
-                yield f"data: {json.dumps({'symbol': symbol, 'name': name, 'volume': int(quantity), 'roi': roi, 'cash': cash, 'total_investment': total_investment_for_symbol, 'total_stock_value': total_stock_value, 'price': f'{price_difference:.2f}'}, default=decimal_encoder)}\n\n"
+                yield f"data: {json.dumps({'symbol': symbol, 'name': name, 'volume': int(quantity), 'roi': round(roi, 2), 'cash': cash, 'total_investment': round(total_investment_for_symbol, 2), 'total_stock_value': round(total_stock_value, 2), 'price': f'{price_difference:.2f}'}, default=decimal_encoder)}\n\n"
 
     finally:
         if consumer:
@@ -473,6 +416,7 @@ async def event_stream(user_id, consumer):
             cursor.close()
         if db:
             db.close()
+
 
 
 
@@ -496,7 +440,24 @@ async def get_realtime_roi(request: Request, redis=Depends(get_redis)):
     consumer = await async_kafka_consumer(topic, group_id)
     logger.critical("Kafka Consumer initialized for topic: %s, group_id: %s", topic, group_id)
 
-    return StreamingResponse(event_stream(user_id, consumer), media_type="text/event-stream")
+    # StreamingResponse 생성
+    response = StreamingResponse(
+        event_stream(user_id, consumer), 
+        media_type="text/event-stream"
+    )
+
+    # 요청한 출처(Origin)를 검사하여 허용된 출처만 Access-Control-Allow-Origin 헤더에 추가
+    allowed_origins = ["https://stockly-frontend.vercel.app", "http://localhost:5173"]
+    origin = request.headers.get("origin")
+    
+    if origin in allowed_origins:
+        response.headers["Access-Control-Allow-Origin"] = origin
+    
+    response.headers["Access-Control-Allow-Credentials"] = "true"
+    response.headers["Cache-Control"] = "no-cache"
+    response.headers["Connection"] = "keep-alive"
+
+    return response
 
 # 최신 보유 주식 수익률 조회
 @router.get('/roi/latest')
@@ -504,42 +465,45 @@ async def get_latest_roi(request: Request, redis=Depends(get_redis)):
     session_id = request.cookies.get("session_id")
     if not session_id:
         raise HTTPException(status_code=401, detail="세션 ID가 없습니다.")
-    
+
     user_id = await get_user_from_session(session_id, redis)  # Redis에서 사용자 ID 조회
     db = get_db_connection()
-    
+
     try:
         cursor = db.cursor(dictionary=True)  # 딕셔너리 형식으로 결과 반환
-        
+
         # 보유 중인 주식 정보 조회
         query = """
             SELECT
                 co.symbol,
                 co.name,
-                so.quantity AS volume,
-                so.price AS purchase_price,
+                SUM(CASE WHEN so.type = '매수' THEN so.quantity ELSE 0 END) - 
+                SUM(CASE WHEN so.type = '매도' THEN so.quantity ELSE 0 END) AS volume,
+                SUM(CASE WHEN so.type = '매수' THEN so.quantity * so.price ELSE 0 END) / NULLIF(SUM(CASE WHEN so.type = '매수' THEN so.quantity ELSE 0 END), 0) AS purchase_price,
                 s.close AS current_price,
-                (s.close - so.price) AS price_difference,
-                ROUND(((s.close - so.price) / so.price) * 100, 2) AS roi,
-                s.close * so.quantity AS total_stock_prices
+                s.close - (SUM(CASE WHEN so.type = '매수' THEN so.quantity * so.price ELSE 0 END) / NULLIF(SUM(CASE WHEN so.type = '매수' THEN so.quantity ELSE 0 END), 0)) AS price_difference,
+                ROUND(((s.close - (SUM(CASE WHEN so.type = '매수' THEN so.quantity * so.price ELSE 0 END) / NULLIF(SUM(CASE WHEN so.type = '매수' THEN so.quantity ELSE 0 END), 0))) / (SUM(CASE WHEN so.type = '매수' THEN so.quantity * so.price ELSE 0 END) / NULLIF(SUM(CASE WHEN so.type = '매수' THEN so.quantity ELSE 0 END), 0))) * 100, 2) AS roi,
+                s.close * (SUM(CASE WHEN so.type = '매수' THEN so.quantity ELSE 0 END) - SUM(CASE WHEN so.type = '매도' THEN so.quantity ELSE 0 END)) AS total_stock_prices
             FROM stock_order AS so
             INNER JOIN company AS co ON so.company_id = co.id
             INNER JOIN stock AS s ON co.symbol = s.symbol
             WHERE so.user_id = %s AND so.is_deleted = FALSE
             AND s.date = (SELECT MAX(date) FROM stock WHERE stock.symbol = co.symbol)
+            GROUP BY co.symbol, co.name, s.close
         """
         cursor.execute(query, (user_id,))
         results = cursor.fetchall()
-        
+
         # 데이터가 없을 경우
         if not results:
             return {"message": "보유 중인 주식이 없습니다.", "data": []}
-        
+
         # 데이터 반환
         return {"message": "종목별 최신 수익률을 조회했습니다.", "data": results}
-    
+
     finally:
         db.close()
+
 
 # 최신 종합 주식율 조회
 @router.get('/roi/total/latest')
@@ -554,18 +518,27 @@ async def get_latest_roi(request: Request, redis=Depends(get_redis)):
 
 # 매도/매수 가능 수량 조회
 @router.get('/info')
-async def get_stock_info(request: Request, redis=Depends(get_redis)):
-    body = await request.json()
-    symbol = body.get('symbol')
-    stock_type = body.get('type')
-
-    if not symbol or not stock_type:
+async def get_stock_info(request: Request, symbol: str = Query, type: str = Query, redis=Depends(get_redis)):
+    logger.critical(f"Request received for get_stock_info with symbol: {symbol}, type: {type}")
+    if not symbol or not type:
+        logger.critical("Missing required parameters: symbol or type")
         raise HTTPException(status_code=400, detail="symbol과 type이 필요합니다.")
+
+    if type not in ['buy', 'sell']:
+        logger.critical(f"Invalid type value: {type}")
+        raise HTTPException(status_code=400, detail="잘못된 type 값입니다.")
 
     session_id = request.cookies.get("session_id")
     if not session_id:
+        logger.critical("Missing session ID in request cookies")
         raise HTTPException(status_code=401, detail="세션 ID가 없습니다.")
 
-    db = get_db_connection()
-    stock_info = await get_stock_orders(session_id, symbol, stock_type, redis, db)
-    return {"message": "주식 정보 조회", "data": stock_info}
+    try:
+        db = get_db_connection()
+        logger.critical("Database connection established successfully")
+        stock_info = await get_stock_orders(session_id, symbol, type, redis, db)
+        logger.critical(f"Successfully retrieved stock info: {stock_info}")
+        return {"message": "주식 정보 조회", "data": stock_info}
+    except Exception as e:
+        logger.critical(f"Unexpected error in get_stock_info: {e}")
+        raise HTTPException(status_code=500, detail="서버 내부 오류가 발생했습니다.")

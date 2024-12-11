@@ -56,6 +56,6 @@ app.add_middleware(
 )
 
 
-# @app.get("/")
-# def hello():
-#     return {"message": "order service consumer 메인페이지입니다"}
+@app.get("/")
+def hello():
+    return {"message": "order service consumer 메인페이지입니다"}
