@@ -348,7 +348,8 @@ async def get_realtime_total_roi(request: Request, redis=Depends(get_redis)):
                         'cash': round(cash, 2), 
                         'total_investment': round(total_investment, 2), 
                         'total_stock_value': round(total_stock_value, 2), 
-                        'asset_difference': round(asset_difference, 2)
+                        'asset_difference': round(asset_difference, 2),
+                        'total_asset': round(cash + total_stock_value, 2)  # 총자산 추가
                     })}\n\n"
 
                 except Exception as e:

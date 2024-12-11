@@ -318,9 +318,10 @@ async def get_latest_roi_from_session(session_id: str, redis, db):
         result_dict = {
             "roi": total_roi,
             "cash": cash,
-            "total_investment": total_investment,
-            "total_stock_value": total_stock_value,
-            "asset_difference": asset_difference
+            "total_investment": total_investment, # 총 투자 금액
+            "total_stock_value": total_stock_value, # 주식의 총 가치
+            "asset_difference": asset_difference, # 자산 차
+            "total_asset": cash + total_stock_value,
         }
 
         return result_dict
