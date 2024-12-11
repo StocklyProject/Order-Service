@@ -377,36 +377,31 @@ async def event_stream(user_id, consumer):
         """, (user_id,))
         holdings = cursor.fetchall()
 
-        if not holdings:
-            yield f"data: {json.dumps({'message': 'No holdings found.'}, default=decimal_encoder)}\n\n"
-            return
-
-        holdings_dict = {}
-        for holding in holdings:
-            symbol = holding["symbol"]
-            if symbol not in holdings_dict:
-                holdings_dict[symbol] = holding
-            else:
-                holdings_dict[symbol]["total_quantity"] += holding["total_quantity"]
-                holdings_dict[symbol]["total_investment"] += holding["total_investment"]
+        holdings_dict = {holding["symbol"]: holding for holding in holdings}
 
         cursor.execute("SELECT cash FROM user_data WHERE id = %s", (user_id,))
         user_data = cursor.fetchone()
         cash = user_data["cash"] if user_data else 0
 
+        last_prices = {}
+
         async for msg in consumer:
             data = msg.value
-            current_prices = {data["symbol"]: data["close"]} if "symbol" in data and "close" in data else {}
+            symbol = data.get("symbol")
+            current_price = data.get("close")
 
-            for symbol, holding in holdings_dict.items():
+            if symbol and current_price:
+                if last_prices.get(symbol) == current_price:
+                    continue  # 🔥 중복 가격 필터링
+                last_prices[symbol] = current_price
+
+                holding = holdings_dict.get(symbol)
+                if not holding:
+                    continue
+
                 name = holding["name"]
                 quantity = float(holding["total_quantity"])
                 total_investment_for_symbol = float(holding["total_investment"])
-
-                current_price = current_prices.get(symbol, 0.0)
-                if current_price == 0.0:
-                    continue
-
                 total_stock_value = current_price * quantity
                 avg_buy_price = total_investment_for_symbol / quantity if quantity > 0 else 0
                 roi = ((current_price - avg_buy_price) / avg_buy_price) * 100 if avg_buy_price > 0 else 0
@@ -421,6 +416,7 @@ async def event_stream(user_id, consumer):
             cursor.close()
         if db:
             db.close()
+
 
 
 
