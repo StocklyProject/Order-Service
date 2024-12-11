@@ -334,13 +334,11 @@ async def get_realtime_total_roi(request: Request, redis=Depends(get_redis)):
                     if symbol and close_price:
                         current_prices[symbol] = close_price
 
-                    # 🛠️ 보유 주식의 총 매수 금액을 계산 (total_quantity * average_buy_price)
                     total_investment = sum(
                         float(holding['total_quantity']) * float(holding['average_buy_price'])
                         for holding in holdings
                     )
 
-                    # 🛠️ 보유 주식의 현재 시장 가치를 계산
                     total_stock_value = sum(
                         float(current_prices.get(holding['symbol'], 0)) * float(holding['total_quantity'])
                         for holding in holdings
@@ -380,19 +378,17 @@ async def get_realtime_total_roi(request: Request, redis=Depends(get_redis)):
 
     response = StreamingResponse(event_stream(), media_type="text/event-stream")
 
-    # CORS 헤더 추가
     allowed_origins = ["https://stockly-frontend.vercel.app", "http://localhost:5173"]
     origin = request.headers.get("origin")
-    
+
     if origin in allowed_origins:
         response.headers["Access-Control-Allow-Origin"] = origin
-    
+
     response.headers["Access-Control-Allow-Credentials"] = "true"
     response.headers["Cache-Control"] = "no-cache"
     response.headers["Connection"] = "keep-alive"
 
     return response
-
 
 
 def decimal_encoder(obj):
