@@ -289,11 +289,12 @@ async def get_realtime_total_roi(request: Request, redis=Depends(get_redis)):
 
         try:
             db = get_db_connection()
-            cursor = db.cursor(dictionary=True)
+            cursor = db.cursor(dictionary=True, buffered=True)  # 🔥 buffered=True 추가
 
             try:
-                cursor.execute("SELECT cash FROM user_data WHERE user_id = %s", (user_id,))
+                cursor.execute("SELECT cash FROM user_data WHERE user_id = %s LIMIT 1", (user_id,))  # 🔥 LIMIT 1 추가
                 user_data = cursor.fetchone()
+                cursor.nextset()  # 🔥 추가된 nextset()으로 미소진 결과 집합 소진
             except mysql.connector.errors.InternalError as e:
                 logger.error("Failed to fetch user cash data: %s", e)
                 raise e
@@ -321,10 +322,6 @@ async def get_realtime_total_roi(request: Request, redis=Depends(get_redis)):
                 logger.error("Failed to fetch holdings for User ID %s: %s", user_id, e)
                 raise e
 
-            if not holdings:
-                yield f"data: {json.dumps({'roi': 0, 'cash': round(cash, 2), 'total_investment': 0, 'total_stock_value': 0, 'asset_difference': round(cash, 2)})}\n\n"
-                return
-
             async for msg in consumer:
                 try:
                     data = msg.value
@@ -344,18 +341,10 @@ async def get_realtime_total_roi(request: Request, redis=Depends(get_redis)):
                         for holding in holdings
                     )
 
-                    portfolio_roi = ((
-                                                 total_stock_value - total_investment) / total_investment * 100) if total_investment > 0 else 0
+                    portfolio_roi = ((total_stock_value - total_investment) / total_investment * 100) if total_investment > 0 else 0
                     asset_difference = total_stock_value - total_investment
 
-                    yield f"data: {json.dumps({
-                        'roi': round(portfolio_roi, 2),
-                        'cash': round(cash, 2),
-                        'total_investment': round(total_investment, 2),
-                        'total_stock_value': round(total_stock_value, 2),
-                        'asset_difference': round(asset_difference, 2),
-                        'total_asset': round(cash + total_stock_value, 2)
-                    })}\n\n"
+                    yield f"data: {json.dumps({'roi': round(portfolio_roi, 2), 'cash': round(cash, 2), 'total_investment': round(total_investment, 2), 'total_stock_value': round(total_stock_value, 2), 'asset_difference': round(asset_difference, 2), 'total_asset': round(cash + total_stock_value, 2)})}\n\n"
 
                 except Exception as e:
                     logger.error("Error while processing Kafka message: %s", e)
@@ -370,26 +359,14 @@ async def get_realtime_total_roi(request: Request, redis=Depends(get_redis)):
                 if consumer:
                     await consumer.stop()
                 if cursor:
-                    cursor.close()
+                    cursor.close()  # 🔥 커서 닫기 추가
                 if db:
                     db.close()
             except Exception as e:
                 logger.error("Error while closing resources: %s", e)
 
     response = StreamingResponse(event_stream(), media_type="text/event-stream")
-
-    allowed_origins = ["https://stockly-frontend.vercel.app", "http://localhost:5173"]
-    origin = request.headers.get("origin")
-
-    if origin in allowed_origins:
-        response.headers["Access-Control-Allow-Origin"] = origin
-
-    response.headers["Access-Control-Allow-Credentials"] = "true"
-    response.headers["Cache-Control"] = "no-cache"
-    response.headers["Connection"] = "keep-alive"
-
     return response
-
 
 def decimal_encoder(obj):
     if isinstance(obj, Decimal):
