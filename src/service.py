@@ -282,7 +282,7 @@ def update_daily_roi_for_all_users(db):
 async def get_latest_roi_from_session(session_id: str, redis, db):
     user_id = await get_user_from_session(session_id, redis)
     try:
-        cursor = db.cursor()
+        cursor = db.cursor(dictionary=True)  # 🔥 dictionary=True로 변경하면 자동으로 dict로 반환됩니다.
 
         # 🔥 1️⃣ user_data 테이블에서 기본 정보 가져오기
         query = """
@@ -304,10 +304,10 @@ async def get_latest_roi_from_session(session_id: str, redis, db):
         if not result:
             raise HTTPException(status_code=404, detail="해당 유저의 데이터를 찾을 수 없습니다.")
 
-        # DB로부터 받은 결과 매핑
-        total_roi = float(result[0])  # 수익률
-        total_stock_value = float(result[1])  # 현재 보유 중인 주식의 총 시세
-        cash = float(result[2])  # 보유 현금
+        # 🔥 DB로부터 받은 결과 매핑
+        total_roi = float(result['total_roi']) if result['total_roi'] is not None else 0.0  # 수익률
+        total_stock_value = float(result['total_stock']) if result['total_stock'] is not None else 0.0  # 현재 보유 중인 주식의 총 시세
+        cash = float(result['cash']) if result['cash'] is not None else 0.0  # 보유 현금
 
         # 🔥 2️⃣ 보유 주식의 총 매수 금액 (total_investment) 계산
         try:
@@ -323,16 +323,17 @@ async def get_latest_roi_from_session(session_id: str, redis, db):
             ) sq ON so.company_id = sq.company_id 
             WHERE so.user_id = %s AND so.type = '매수' AND so.is_deleted = FALSE;
             """, (user_id, user_id))
-            total_investment = cursor.fetchone()[0] or 0  # 총 투자 금액 (현재 보유 주식의 매수 원가 총합)
+            total_investment = cursor.fetchone()['total_investment']  # 🔥 dictionary로 받기 때문에 'total_investment'로 접근
+            total_investment = float(total_investment) if total_investment is not None else 0.0  # 🔥 float 변환
         except Exception as e:
             logger.error("Failed to fetch total investment for User ID %s: %s", user_id, e)
-            total_investment = 0
+            total_investment = 0.0
 
         # 🔥 3️⃣ 자산 차이(asset_difference) 계산
-        asset_difference = total_stock_value - total_investment  # 주식 자산 - 투자 금액
+        asset_difference = float(total_stock_value) - float(total_investment)  # 주식 자산 - 투자 금액
 
         # 🔥 4️⃣ 총 자산(total_asset) 계산
-        total_asset = cash + total_stock_value  # 총 자산 = 현금 + 주식의 현재 시세
+        total_asset = float(cash) + float(total_stock_value)  # 총 자산 = 현금 + 주식의 현재 시세
 
         # 🔥 5️⃣ JSON 형태로 변환 (최종 반환 값)
         result_dict = {
