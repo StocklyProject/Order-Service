@@ -312,7 +312,7 @@ async def get_latest_roi_from_session(session_id: str, redis, db):
         # 데이터 계산
         total_investment = total_asset - cash  # 총 투자 금액 (총 자산 - 현금)
         total_stock_value = total_stock  # 주식의 총 가치
-        asset_difference = total_asset - (total_stock + cash)  # 자산 차이 (총 자산 - (주식 총 가치 + 현금))
+        asset_difference = total_investment - total_stock  # 투자 금액 - 주식 가치
 
         # JSON 형태로 변환
         result_dict = {
