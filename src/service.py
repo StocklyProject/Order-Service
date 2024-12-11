@@ -140,7 +140,7 @@ def get_stocks(user_id: int, db):
             so.status
         FROM stock_order so
         INNER JOIN company c ON so.company_id = c.id
-        WHERE so.user_id = %s
+        WHERE so.user_id = %s AND so.is_deleted = 0
         ORDER BY so.created_at DESC
     """, (user_id,))
     results = cursor.fetchall()
