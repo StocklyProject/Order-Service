@@ -79,21 +79,23 @@ async def process_order(
     # 사용자 ID 가져오기
     user_id = await get_user_from_session(session_id, redis)
 
-    cursor = db.cursor(dictionary=True)
+    cursor = db.cursor(dictionary=True, buffered=True)  # 🔥 buffered=True 추가
 
     try:
         db.autocommit = False
 
         # 회사 정보 조회
-        cursor.execute("SELECT id FROM company WHERE symbol = %s", (body.symbol,))
+        cursor.execute("SELECT id FROM company WHERE symbol = %s LIMIT 1", (body.symbol,))  # 🔥 LIMIT 1 추가
         company_data = cursor.fetchone()
+        cursor.nextset()  # 🔥 추가된 nextset()으로 미소진 결과 집합 소진
         if not company_data:
             raise HTTPException(status_code=404, detail=f"심볼 '{body.symbol}'에 해당하는 회사가 없습니다.")
         company_id = company_data["id"]
 
         # 사용자 자산 정보 조회
-        cursor.execute("SELECT cash FROM user_data WHERE user_id = %s", (user_id,))
+        cursor.execute("SELECT cash FROM user_data WHERE user_id = %s LIMIT 1", (user_id,))  # 🔥 LIMIT 1 추가
         user_data = cursor.fetchone()
+        cursor.nextset()
         if not user_data:
             raise HTTPException(status_code=404, detail="사용자 정보를 찾을 수 없습니다.")
         user_cash = user_data["cash"]
@@ -151,6 +153,7 @@ async def process_order(
                 (user_id, company_id),
             )
             user_stock_quantity = cursor.fetchone()["total_quantity"]
+            cursor.nextset()
 
             if user_stock_quantity < body.quantity:
                 raise HTTPException(status_code=400, detail="보유 주식 수량이 부족하여 매도할 수 없습니다.")
@@ -188,24 +191,6 @@ async def process_order(
                 order_status,
             ),
         )
-
-        # 자산 데이터 갱신
-        if order_status == "체결":
-            cursor.execute(
-                """
-                UPDATE user_data
-                SET cash = %s, 
-                    total_stock = (
-                        SELECT 
-                            IFNULL(SUM(price * quantity), 0) 
-                        FROM stock_order 
-                        WHERE user_id = %s AND type = '매수' AND is_deleted = 0
-                    ),
-                    total_asset = cash + total_stock
-                WHERE user_id = %s
-                """,
-                (user_cash, user_id, user_id),
-            )
 
         db.commit()
 
@@ -380,7 +365,6 @@ async def event_stream(user_id, consumer):
         db = get_db_connection()
         cursor = db.cursor(dictionary=True)
 
-        # 사용자 보유 주식 정보 가져오기
         cursor.execute("""
             SELECT company.symbol, company.name,
                    SUM(CASE WHEN so.type = '매수' THEN so.quantity ELSE 0 END) -
@@ -392,57 +376,43 @@ async def event_stream(user_id, consumer):
             GROUP BY company.symbol, company.name
         """, (user_id,))
         holdings = cursor.fetchall()
-        logger.critical("Holdings for User ID %s: %s", user_id, holdings)
 
         if not holdings:
-            logger.critical("No holdings found for User ID: %s", user_id)
             yield f"data: {json.dumps({'message': 'No holdings found.'}, default=decimal_encoder)}\n\n"
             return
 
-        # 사용자 보유 현금 가져오기
+        holdings_dict = {}
+        for holding in holdings:
+            symbol = holding["symbol"]
+            if symbol not in holdings_dict:
+                holdings_dict[symbol] = holding
+            else:
+                holdings_dict[symbol]["total_quantity"] += holding["total_quantity"]
+                holdings_dict[symbol]["total_investment"] += holding["total_investment"]
+
         cursor.execute("SELECT cash FROM user_data WHERE id = %s", (user_id,))
         user_data = cursor.fetchone()
         cash = user_data["cash"] if user_data else 0
-        logger.critical("User ID %s, Cash: %s", user_id, cash)
 
-        # Kafka 메시지 처리
         async for msg in consumer:
-            logger.critical("Kafka Message Received: %s", msg.value)
             data = msg.value
-
-            # 실시간 가격 데이터 매핑
             current_prices = {data["symbol"]: data["close"]} if "symbol" in data and "close" in data else {}
-            logger.critical("Current Prices: %s", current_prices)
 
-            for holding in holdings:
-                symbol = holding["symbol"]
+            for symbol, holding in holdings_dict.items():
                 name = holding["name"]
-                quantity = float(holding["total_quantity"])  # Decimal -> float
-                total_investment_for_symbol = float(holding["total_investment"])  # Decimal -> float
+                quantity = float(holding["total_quantity"])
+                total_investment_for_symbol = float(holding["total_investment"])
 
-                # 현재 심볼에 해당하는 실시간 가격 가져오기
                 current_price = current_prices.get(symbol, 0.0)
                 if current_price == 0.0:
-                    logger.warning("Symbol %s not found or price is 0 in real-time data.", symbol)
                     continue
 
-                # 종목 수익률 및 평가 금액 계산
                 total_stock_value = current_price * quantity
-                roi = ((current_price - (total_investment_for_symbol / quantity)) / 
-                       (total_investment_for_symbol / quantity)) * 100 if quantity > 0 else 0
-                roi = round(roi, 2)
-
-                # 현재 가격 - 평균 매수 가격 계산
                 avg_buy_price = total_investment_for_symbol / quantity if quantity > 0 else 0
+                roi = ((current_price - avg_buy_price) / avg_buy_price) * 100 if avg_buy_price > 0 else 0
                 price_difference = current_price - avg_buy_price
 
-                logger.critical(
-                    "Symbol: %s, Name: %s, Quantity: %s, Total Investment: %s, Current Price: %s, ROI: %s, Stock Value: %s, Price Diff: %s",
-                    symbol, name, quantity, total_investment_for_symbol, current_price, roi, total_stock_value, price_difference
-                )
-
-                # 단일 객체로 반환
-                yield f"data: {json.dumps({'symbol': symbol, 'name': name, 'volume': int(quantity), 'roi': roi, 'cash': cash, 'total_investment': total_investment_for_symbol, 'total_stock_value': total_stock_value, 'price': f'{price_difference:.2f}'}, default=decimal_encoder)}\n\n"
+                yield f"data: {json.dumps({'symbol': symbol, 'name': name, 'volume': int(quantity), 'roi': round(roi, 2), 'cash': cash, 'total_investment': round(total_investment_for_symbol, 2), 'total_stock_value': round(total_stock_value, 2), 'price': f'{price_difference:.2f}'}, default=decimal_encoder)}\n\n"
 
     finally:
         if consumer:
