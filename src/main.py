@@ -26,16 +26,16 @@ async def lifespan(app: FastAPI):
     scheduler.start()
 
     # 매일 오후 3시 10분에 실행되는 작업 추가
-    # scheduler.add_job(
-    #     update_daily_roi,
-    #     CronTrigger(hour=15, minute=10, timezone="Asia/Seoul")  # 시간대 설정
-    # )
-
-    # 1분마다 실행되도록 작업 추가 (테스트용)
     scheduler.add_job(
         update_daily_roi,
-        CronTrigger(minute="*", second=0, timezone="Asia/Seoul")  # 1분마다 실행
+        CronTrigger(hour=15, minute=10, timezone="Asia/Seoul")  # 시간대 설정
     )
+
+    # 1분마다 실행되도록 작업 추가 (테스트용)
+    # scheduler.add_job(
+    #     update_daily_roi,
+    #     CronTrigger(minute="*", second=0, timezone="Asia/Seoul")  # 1분마다 실행
+    # )
 
     try:
         yield

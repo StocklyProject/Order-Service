@@ -99,7 +99,8 @@ def add_cash_to_user(user_id: int, amount: int, db):
         db.commit()
     except Exception as e:
         db.rollback()  # 문제가 생기면 롤백
-        raise HTTPException(status_code=500, detail="서버 오류로 인해 요청을 처리할 수 없습니다.") from e
+        logger.critical(f"Error adding cash to user: {e}")
+        raise HTTPException(status_code=500, detail="서버 오류로 인해 요청을 처리할 수 없습니다") from e
     finally:
         cursor.close()
         

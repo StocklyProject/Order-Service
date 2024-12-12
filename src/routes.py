@@ -62,7 +62,6 @@ async def reset_assets(request: Request, redis=Depends(get_redis)):
     finally:
         db.close()
 
-
 @router.post("/order")
 async def process_order(
     request: Request,
@@ -76,70 +75,105 @@ async def process_order(
     if not session_id:
         raise HTTPException(status_code=401, detail="세션 ID가 유효하지 않습니다.")
 
-    # 사용자 ID 가져오기
     user_id = await get_user_from_session(session_id, redis)
 
-    cursor = db.cursor(dictionary=True, buffered=True)  # 🔥 buffered=True 추가
+    cursor = db.cursor(dictionary=True, buffered=True)
 
     try:
         db.autocommit = False
 
-        # 회사 정보 조회
-        cursor.execute("SELECT id FROM company WHERE symbol = %s LIMIT 1", (body.symbol,))  # 🔥 LIMIT 1 추가
+        cursor.execute("SELECT id FROM company WHERE symbol = %s LIMIT 1", (body.symbol,))
         company_data = cursor.fetchone()
-        cursor.nextset()  # 🔥 추가된 nextset()으로 미소진 결과 집합 소진
+        cursor.nextset()
         if not company_data:
             raise HTTPException(status_code=404, detail=f"심볼 '{body.symbol}'에 해당하는 회사가 없습니다.")
         company_id = company_data["id"]
 
-        # 사용자 자산 정보 조회
-        cursor.execute("SELECT cash FROM user_data WHERE user_id = %s LIMIT 1", (user_id,))  # 🔥 LIMIT 1 추가
+        cursor.execute("SELECT cash, total_stock, total_asset FROM user_data WHERE user_id = %s LIMIT 1", (user_id,))
         user_data = cursor.fetchone()
         cursor.nextset()
         if not user_data:
             raise HTTPException(status_code=404, detail="사용자 정보를 찾을 수 없습니다.")
         user_cash = user_data["cash"]
+        user_total_stock = user_data["total_stock"]
+        user_total_asset = user_data["total_asset"]
 
-        # Kafka에서 실시간 데이터 가져오기
         latest_data = await fetch_latest_data_for_symbol(body.symbol)
         if not latest_data:
-            raise HTTPException(status_code=404, detail=f"심볼 '{body.symbol}'에 대한 실시간 데이터가 없습니다.")
+            raise HTTPException(status_code=404, detail=f"심본 '{body.symbol}'에 대한 실시간 데이터가 없습니다.")
 
-        # 호가 데이터 처리
         ask_prices = [
             {"price": float(latest_data[f"sell_price_{i}"]), "volume": int(latest_data[f"sell_volume_{i}"])}
             for i in range(3, 11) if f"sell_price_{i}" in latest_data and f"sell_volume_{i}" in latest_data
-        ]
+        ] # 3~10번째 매도 호가
         bid_prices = [
             {"price": float(latest_data[f"buy_price_{i}"]), "volume": int(latest_data[f"buy_volume_{i}"])}
             for i in range(1, 9) if f"buy_price_{i}" in latest_data and f"buy_volume_{i}" in latest_data
-        ]
+        ] # 1~8번째 매수 호가
+        logger.critical(ask_prices)
+        logger.critical(bid_prices)
 
         execution_price = None
         execution_quantity = None
         total_price = 0
         order_status = "미체결"
 
-        # 매수/매도 처리
         if body.order_type == "매수":
             if body.price_type == "시장가":
                 if not ask_prices:
                     raise HTTPException(status_code=400, detail="시장가 매수 주문에 유효한 매도 호가가 없습니다.")
-                execution_price = ask_prices[0]["price"]
-                execution_quantity = min(body.quantity, ask_prices[0]["volume"])
+                
+                lowest_ask = min(ask_prices, key=lambda x: x["price"])
+                execution_price = lowest_ask["price"]
+                execution_quantity = min(body.quantity, lowest_ask["volume"])
+                logger.critical(f"체결 가격: {execution_price}, 체결 수량: {execution_quantity}")
+
             elif body.price_type == "지정가":
                 valid_asks = [ask for ask in ask_prices if ask["price"] <= body.price]
                 if not valid_asks:
                     raise HTTPException(status_code=400, detail="지정가 매수 주문에 유효한 매도 호가가 없습니다.")
-                execution_price = valid_asks[0]["price"]
-                execution_quantity = min(body.quantity, valid_asks[0]["volume"])
+                
+                lowest_ask = min(valid_asks, key=lambda x: x["price"])
+                execution_price = lowest_ask["price"]
+                execution_quantity = min(body.quantity, lowest_ask["volume"])
+                logger.critical(f"체결 가격: {execution_price}, 체결 수량: {execution_quantity}")
 
-            if execution_price and execution_quantity:
-                total_price = execution_price * execution_quantity
-                if total_price > user_cash:
-                    raise HTTPException(status_code=400, detail="잔액이 부족하여 주문을 처리할 수 없습니다.")
+            total_price = execution_price * execution_quantity if execution_price and execution_quantity else 0
+            remaining_quantity = body.quantity - execution_quantity
+
+            if total_price > 0 and total_price <= user_cash:
                 user_cash -= total_price
+                user_total_stock += execution_quantity * execution_price
+
+            # 주문 상태 구분
+            if execution_quantity == body.quantity:
                 order_status = "체결"
+            elif execution_quantity > 0:
+                order_status = "부분 체결"
+            else:
+                order_status = "미체결"
+
+            # 매수 주문 기록 추가
+            cursor.execute(
+                """
+                INSERT INTO stock_order 
+                (user_id, company_id, type, price, quantity, total_price, status, created_at, updated_at, is_deleted) 
+                VALUES (%s, %s, '매수', %s, %s, %s, %s, NOW(), NOW(), 0)
+                """,
+                (user_id, company_id, execution_price, execution_quantity, total_price, order_status)
+            )
+
+            # 미체결 남은 수량 기록 (체결되지 않은 수량 기록)
+            if remaining_quantity > 0:
+                cursor.execute(
+                    """
+                    INSERT INTO stock_order 
+                    (user_id, company_id, type, price, quantity, total_price, status, created_at, updated_at, is_deleted) 
+                    VALUES (%s, %s, '매수', %s, %s, %s, %s, NOW(), NOW(), 0)
+                    """,
+                    (user_id, company_id, body.price, remaining_quantity, 0, '미체결')
+                )
+
 
         elif body.order_type == "매도":
             cursor.execute(
@@ -153,55 +187,74 @@ async def process_order(
                 (user_id, company_id),
             )
             user_stock_quantity = cursor.fetchone()["total_quantity"]
-            cursor.nextset()
 
             if user_stock_quantity < body.quantity:
-                raise HTTPException(status_code=400, detail="보유 주식 수량이 부족하여 매도할 수 없습니다.")
-
+                raise HTTPException(status_code=400, detail="보유 주식 수량이 부족해서 매도할 수 없습니다.")
+            
             if body.price_type == "시장가":
                 if not bid_prices:
                     raise HTTPException(status_code=400, detail="시장가 매도 주문에 유효한 매수 호가가 없습니다.")
-                execution_price = bid_prices[0]["price"]
-                execution_quantity = min(body.quantity, bid_prices[0]["volume"])
+                
+                highest_bid = max(bid_prices, key=lambda x: x["price"])
+                execution_price = highest_bid["price"]
+                execution_quantity = min(body.quantity, highest_bid["volume"])
+
             elif body.price_type == "지정가":
                 valid_bids = [bid for bid in bid_prices if bid["price"] >= body.price]
                 if not valid_bids:
                     raise HTTPException(status_code=400, detail="지정가 매도 주문에 유효한 매수 호가가 없습니다.")
-                execution_price = valid_bids[0]["price"]
-                execution_quantity = min(body.quantity, valid_bids[0]["volume"])
+                
+                highest_bid = max(valid_bids, key=lambda x: x["price"])
+                execution_price = highest_bid["price"]
+                execution_quantity = min(body.quantity, highest_bid["volume"])
 
-            if execution_price and execution_quantity:
-                total_price = execution_price * execution_quantity
+            total_price = execution_price * execution_quantity if execution_price and execution_quantity else 0
+            remaining_quantity = body.quantity - execution_quantity
+
+            if total_price > 0:
                 user_cash += total_price
-                order_status = "체결"
+                user_total_stock -= execution_quantity * execution_price
 
-        # 주문 기록 저장
+            if execution_quantity == body.quantity:
+                order_status = "체결"
+            elif execution_quantity > 0:
+                order_status = "부분 체결"
+            else:
+                order_status = "미체결"
+
+            cursor.execute(
+                """
+                INSERT INTO stock_order 
+                (user_id, company_id, type, price, quantity, total_price, status, created_at, updated_at, is_deleted) 
+                VALUES (%s, %s, '매도', %s, %s, %s, %s, NOW(), NOW(), 0)
+                """,
+                (user_id, company_id, execution_price, execution_quantity, total_price, order_status)
+            )
+
+            if remaining_quantity > 0:
+                cursor.execute(
+                    """
+                    INSERT INTO stock_order 
+                    (user_id, company_id, type, price, quantity, total_price, status, created_at, updated_at, is_deleted) 
+                    VALUES (%s, %s, '매도', %s, %s, %s, %s, NOW(), NOW(), 0)
+                    """,
+                    (user_id, company_id, body.price, remaining_quantity, 0, '미체결')
+                )
+
+        total_portfolio_value = user_cash + user_total_stock
         cursor.execute(
             """
-            INSERT INTO stock_order (user_id, company_id, type, price, quantity, total_price, status)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            UPDATE user_data SET cash = %s, total_stock = %s, total_asset = %s, total_roi = %s WHERE user_id = %s
             """,
-            (
-                user_id,
-                company_id,
-                body.order_type,
-                execution_price,
-                execution_quantity,
-                total_price,
-                order_status,
-            ),
+            (user_cash, user_total_stock, total_portfolio_value, 0, user_id)
         )
-
+            
         db.commit()
 
-    except HTTPException as http_err:
-        db.rollback()
-        logger.error("HTTP error during order processing: %s", str(http_err.detail))
-        raise http_err
     except Exception as e:
         db.rollback()
-        logger.error("Error during order processing: %s", str(e))
-        raise HTTPException(status_code=500, detail="주문 처리 중 오류가 발생했습니다.")
+        logger.error("Failed to process order: %s", e)
+        raise HTTPException(status_code=500, detail="주민 처리 중 오류가 발생했습니다.")
     finally:
         cursor.close()
 
@@ -209,7 +262,7 @@ async def process_order(
         "status": order_status,
         "execution_price": execution_price,
         "execution_quantity": execution_quantity,
-        "total_price": total_price,
+        "total_price": total_price
     }
 
 
@@ -236,7 +289,12 @@ async def get_user_daily_roi(request: Request, redis=Depends(get_redis)):
     db = get_db_connection()
     try:
         cursor = db.cursor()
-        cursor.execute("SELECT total_roi, created_at FROM user_data WHERE id = %s", (user_id,))
+        today = datetime.now().date()
+        cursor.execute("""
+            SELECT total_roi, created_at 
+            FROM user_data 
+            WHERE id = %s AND DATE(created_at) < %s
+        """, (user_id, today))
         rows = cursor.fetchall()  # 여러 행 가져오기
 
         # 데이터를 딕셔너리로 변환
@@ -245,6 +303,7 @@ async def get_user_daily_roi(request: Request, redis=Depends(get_redis)):
         return {"message": "일일 수익률을 조회했습니다.", "total_roi": total_roi}
     finally:
         db.close()
+
 
 
 @router.get('/roi/realtime/total')
@@ -407,7 +466,7 @@ async def event_stream(user_id, consumer):
                 roi = ((current_price - avg_buy_price) / avg_buy_price) * 100 if avg_buy_price > 0 else 0
                 price_difference = current_price - avg_buy_price
 
-                yield f"data: {json.dumps({'symbol': symbol, 'name': name, 'volume': int(quantity), 'roi': round(roi, 2), 'cash': cash, 'total_investment': round(total_investment_for_symbol, 2), 'total_stock_value': round(total_stock_value, 2), 'price': f'{price_difference:.2f}'}, default=decimal_encoder)}\n\n"
+                yield f"data: {json.dumps({'symbol': symbol, 'name': name, 'volume': int(quantity), 'roi': round(roi, 2), 'cash': cash, 'total_investment': round(total_investment_for_symbol, 2), 'total_stock_value': round(total_stock_value, 2), 'price': f'{price_difference:.2f}', 'current_price': current_price}, default=decimal_encoder)}\n\n"
 
     finally:
         if consumer:
@@ -459,7 +518,7 @@ async def get_realtime_roi(request: Request, redis=Depends(get_redis)):
 
     return response
 
-# 최신 보유 주식 수익률 조회
+# 최신 보유 주식 수익률 조회 API
 @router.get('/roi/latest')
 async def get_latest_roi(request: Request, redis=Depends(get_redis)):
     session_id = request.cookies.get("session_id")
@@ -472,18 +531,34 @@ async def get_latest_roi(request: Request, redis=Depends(get_redis)):
     try:
         cursor = db.cursor(dictionary=True)  # 딕셔너리 형식으로 결과 반환
 
-        # 보유 중인 주식 정보 조회
+        # 보유 중인 주식 정보 조회 쿼리
         query = """
             SELECT
                 co.symbol,
                 co.name,
                 SUM(CASE WHEN so.type = '매수' THEN so.quantity ELSE 0 END) - 
                 SUM(CASE WHEN so.type = '매도' THEN so.quantity ELSE 0 END) AS volume,
-                SUM(CASE WHEN so.type = '매수' THEN so.quantity * so.price ELSE 0 END) / NULLIF(SUM(CASE WHEN so.type = '매수' THEN so.quantity ELSE 0 END), 0) AS purchase_price,
+                
+                -- 매수 평균 단가 계산
+                ROUND(SUM(CASE WHEN so.type = '매수' THEN so.quantity * so.price ELSE 0 END) / 
+                NULLIF(SUM(CASE WHEN so.type = '매수' THEN so.quantity ELSE 0 END), 0), 2) AS purchase_price,
+                
+                -- 현재 주식의 종가
                 s.close AS current_price,
-                s.close - (SUM(CASE WHEN so.type = '매수' THEN so.quantity * so.price ELSE 0 END) / NULLIF(SUM(CASE WHEN so.type = '매수' THEN so.quantity ELSE 0 END), 0)) AS price_difference,
-                ROUND(((s.close - (SUM(CASE WHEN so.type = '매수' THEN so.quantity * so.price ELSE 0 END) / NULLIF(SUM(CASE WHEN so.type = '매수' THEN so.quantity ELSE 0 END), 0))) / (SUM(CASE WHEN so.type = '매수' THEN so.quantity * so.price ELSE 0 END) / NULLIF(SUM(CASE WHEN so.type = '매수' THEN so.quantity ELSE 0 END), 0))) * 100, 2) AS roi,
-                s.close * (SUM(CASE WHEN so.type = '매수' THEN so.quantity ELSE 0 END) - SUM(CASE WHEN so.type = '매도' THEN so.quantity ELSE 0 END)) AS total_stock_prices
+                
+                -- 현재 가격과 매입 가격의 차이
+                ROUND(s.close - (SUM(CASE WHEN so.type = '매수' THEN so.quantity * so.price ELSE 0 END) / 
+                NULLIF(SUM(CASE WHEN so.type = '매수' THEN so.quantity ELSE 0 END), 0)), 2) AS price_difference,
+                
+                -- 수익률 계산 (소수점 2자리까지 반올림)
+                ROUND(((s.close - (SUM(CASE WHEN so.type = '매수' THEN so.quantity * so.price ELSE 0 END) / 
+                NULLIF(SUM(CASE WHEN so.type = '매수' THEN so.quantity ELSE 0 END), 0))) / 
+                (SUM(CASE WHEN so.type = '매수' THEN so.quantity * so.price ELSE 0 END) / 
+                NULLIF(SUM(CASE WHEN so.type = '매수' THEN so.quantity ELSE 0 END), 0))) * 100, 2) AS roi,
+                
+                -- 보유 주식의 총 평가금액
+                ROUND(s.close * (SUM(CASE WHEN so.type = '매수' THEN so.quantity ELSE 0 END) - 
+                SUM(CASE WHEN so.type = '매도' THEN so.quantity ELSE 0 END)), 2) AS total_stock_prices
             FROM stock_order AS so
             INNER JOIN company AS co ON so.company_id = co.id
             INNER JOIN stock AS s ON co.symbol = s.symbol
@@ -491,6 +566,7 @@ async def get_latest_roi(request: Request, redis=Depends(get_redis)):
             AND s.date = (SELECT MAX(date) FROM stock WHERE stock.symbol = co.symbol)
             GROUP BY co.symbol, co.name, s.close
         """
+
         cursor.execute(query, (user_id,))
         results = cursor.fetchall()
 
@@ -498,8 +574,23 @@ async def get_latest_roi(request: Request, redis=Depends(get_redis)):
         if not results:
             return {"message": "보유 중인 주식이 없습니다.", "data": []}
 
+        # 결과 포맷 변경 (필요한 필드만 반환)
+        formatted_results = [
+            {
+                "symbol": row["symbol"],
+                "name": row["name"],
+                "volume": row["volume"],
+                "purchase_price": row["purchase_price"],
+                "current_price": row["current_price"],
+                "price_difference": row["price_difference"],
+                "roi": row["roi"],
+                "total_stock_prices": row["total_stock_prices"]
+            } 
+            for row in results
+        ]
+
         # 데이터 반환
-        return {"message": "종목별 최신 수익률을 조회했습니다.", "data": results}
+        return {"message": "종목별 최신 수익률을 조회했습니다.", "data": formatted_results}
 
     finally:
         db.close()
