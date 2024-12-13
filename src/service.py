@@ -7,25 +7,53 @@ from .consumer import async_kafka_consumer
 from kafka import TopicPartition
 from .logger import logger
 
-# SSE 비동기 이벤트 생성기
 async def sse_event_generator(topic: str, group_id: str, symbol: str):
+    """ SSE 비동기 이벤트 생성기
+    Args:
+        topic (str): Kafka 토픽 이름
+        group_id (str): Kafka 그룹 ID
+        symbol (str): 필터링할 심볼 (종목) 이름
+    """
     consumer = await async_kafka_consumer(topic, group_id)
     try:
+        logger.info(f"Kafka 소비자 시작됨 (topic: {topic}, group_id: {group_id}, symbol: {symbol})")
+
+        # Kafka 메시지 소비 루프
         async for message in consumer:
-            # 메시지의 값을 JSON으로 파싱
             try:
-                data = json.loads(message.value) if isinstance(message.value, str) else message.value
-            except json.JSONDecodeError:
+                # 메시지를 JSON으로 파싱
+                if isinstance(message.value, (bytes, str)):
+                    data = json.loads(
+                        message.value.decode('utf-8') if isinstance(message.value, bytes) else message.value)
+                else:
+                    data = message.value
+
+                # symbol에 맞는 데이터 필터링
+                if isinstance(data, dict) and data.get("symbol") == symbol:
+                    formatted_data = json.dumps(data)
+                    yield f"data: {formatted_data}\n\n"  # 클라이언트에 데이터 전송
+                    logger.debug(f"전송된 데이터: {formatted_data}")
+
+            except json.JSONDecodeError as e:
+                logger.warning(f"JSON 파싱 오류: {e} (message: {message.value})")
+                continue
+            except Exception as e:
+                logger.error(f"메시지 처리 중 오류 발생: {e}")
                 continue
 
-            # JSON으로 파싱된 데이터에서 symbol을 확인
-            if isinstance(data, dict) and data.get("symbol") == symbol:
-                yield f"data: {json.dumps(data)}\n\n"  # 클라이언트에 데이터 전송
-
     except asyncio.CancelledError:
-        pass
+        logger.warning(f"SSE 연결 취소됨 (topic: {topic}, symbol: {symbol})")
+        raise  # 취소 요청을 재전파하여 FastAPI에 정상적으로 알림
+    except Exception as e:
+        logger.error(f"소비자 비정상 종료: {e}")
     finally:
-        await consumer.stop()
+        # 커넥션 종료 보장
+        if consumer is not None:
+            try:
+                await consumer.stop()
+                logger.info(f"Kafka 소비자 종료됨 (topic: {topic}, group_id: {group_id})")
+            except Exception as e:
+                logger.error(f"Kafka 소비자 종료 중 오류 발생: {e}")
 
 async def get_user_from_session(session_id: str, redis):
     user_id_bytes = await redis.get(session_id)
@@ -71,7 +99,8 @@ def add_cash_to_user(user_id: int, amount: int, db):
         db.commit()
     except Exception as e:
         db.rollback()  # 문제가 생기면 롤백
-        raise HTTPException(status_code=500, detail="서버 오류로 인해 요청을 처리할 수 없습니다.") from e
+        logger.critical(f"Error adding cash to user: {e}")
+        raise HTTPException(status_code=500, detail="서버 오류로 인해 요청을 처리할 수 없습니다") from e
     finally:
         cursor.close()
         
@@ -112,7 +141,7 @@ def get_stocks(user_id: int, db):
             so.status
         FROM stock_order so
         INNER JOIN company c ON so.company_id = c.id
-        WHERE so.user_id = %s
+        WHERE so.user_id = %s AND so.is_deleted = 0
         ORDER BY so.created_at DESC
     """, (user_id,))
     results = cursor.fetchall()
@@ -250,16 +279,18 @@ def update_daily_roi_for_all_users(db):
     finally:
         cursor.close()
 
+
 async def get_latest_roi_from_session(session_id: str, redis, db):
     user_id = await get_user_from_session(session_id, redis)
     try:
-        cursor = db.cursor()
+        cursor = db.cursor(dictionary=True)  # 🔥 dictionary=True로 변경하면 자동으로 dict로 반환됩니다.
+
+        # 🔥 1️⃣ user_data 테이블에서 기본 정보 가져오기
         query = """
         SELECT 
             total_roi, 
-            total_asset, 
-            total_stock, 
-            cash 
+            total_stock, -- 보유 주식의 총 시세 (현재 시장 가치)
+            cash -- 보유 현금
         FROM 
             user_data 
         WHERE 
@@ -268,25 +299,75 @@ async def get_latest_roi_from_session(session_id: str, redis, db):
         ORDER BY updated_at DESC 
         LIMIT 1;
         """
-        await cursor.execute(query, (user_id,))
-        result = await cursor.fetchone()
+        cursor.execute(query, (user_id,))
+        result = cursor.fetchone()
+
         if not result:
             raise HTTPException(status_code=404, detail="해당 유저의 데이터를 찾을 수 없습니다.")
-        return result
+
+        # 🔥 DB로부터 받은 결과 매핑
+        total_roi = float(result['total_roi']) if result['total_roi'] is not None else 0.0  # 수익률
+        total_stock_value = float(result['total_stock']) if result['total_stock'] is not None else 0.0  # 현재 보유 중인 주식의 총 시세
+        cash = float(result['cash']) if result['cash'] is not None else 0.0  # 보유 현금
+
+        # 🔥 2️⃣ 보유 주식의 총 매수 금액 (total_investment) 계산
+        try:
+            cursor.execute("""
+            SELECT 
+                SUM((so.quantity - IFNULL(sq.sold_quantity, 0)) * so.price) AS total_investment 
+            FROM stock_order so 
+            LEFT JOIN (
+                SELECT so2.company_id, SUM(so2.quantity) AS sold_quantity 
+                FROM stock_order so2 
+                WHERE so2.user_id = %s AND so2.type = '매도' AND so2.is_deleted = FALSE 
+                GROUP BY so2.company_id
+            ) sq ON so.company_id = sq.company_id 
+            WHERE so.user_id = %s AND so.type = '매수' AND so.is_deleted = FALSE;
+            """, (user_id, user_id))
+            total_investment = cursor.fetchone()['total_investment']  # 🔥 dictionary로 받기 때문에 'total_investment'로 접근
+            total_investment = float(total_investment) if total_investment is not None else 0.0  # 🔥 float 변환
+        except Exception as e:
+            logger.error("Failed to fetch total investment for User ID %s: %s", user_id, e)
+            total_investment = 0.0
+
+        # 🔥 3️⃣ 자산 차이(asset_difference) 계산
+        asset_difference = float(total_stock_value) - float(total_investment)  # 주식 자산 - 투자 금액
+
+        # 🔥 4️⃣ 총 자산(total_asset) 계산
+        total_asset = float(cash) + float(total_stock_value)  # 총 자산 = 현금 + 주식의 현재 시세
+
+        # 🔥 5️⃣ JSON 형태로 변환 (최종 반환 값)
+        result_dict = {
+            "roi": round(total_roi, 2),  # 수익률
+            "cash": round(cash, 2),  # 보유 현금
+            "total_investment": round(total_investment, 2),  # 총 투자 금액 (보유 주식의 매수 원가 총합)
+            "total_stock_value": round(total_stock_value, 2),  # 주식의 총 시세 (현재 시장 가치)
+            "asset_difference": round(asset_difference, 2),  # 자산 차이 (주식 자산 - 투자 금액)
+            "total_asset": round(total_asset, 2)  # 총 자산 (현금 + 주식의 총 시세)
+        }
+
+        return result_dict
+
     except Exception as e:
+        logger.error("Error fetching ROI for User ID %s: %s", user_id, e)
         raise HTTPException(status_code=500, detail=f"DB 조회 중 오류가 발생했습니다: {str(e)}")
+
     finally:
         db.close()
 
 
 # 매도 가능 주식 수량을 조회하는 함수
 async def get_stock_orders(session_id: str, symbol: str, stock_type: str, redis, db):
-    user_id = await get_user_from_session(session_id, redis)
-    logger.critical(f"User ID: {user_id}")
+    logger.critical(f"get_stock_orders called with session_id: {session_id}, symbol: {symbol}, stock_type: {stock_type}")
     try:
+        user_id = await get_user_from_session(session_id, redis)
+        logger.critical(f"User ID retrieved from session: {user_id}")
+        
         cursor = db.cursor(dictionary=True)
+        logger.critical("Database cursor created successfully")
+
         # 매수 가능한 수량 계산을 위해 종가 조회
-        if stock_type == '매수':
+        if stock_type == 'buy':
             price_query = """
                 SELECT 
                     close 
@@ -301,6 +382,7 @@ async def get_stock_orders(session_id: str, symbol: str, stock_type: str, redis,
             """
             cursor.execute(price_query, (symbol,))
             stock_price_result = cursor.fetchone()
+            logger.critical(f"Stock price query result: {stock_price_result}")
 
             if stock_price_result is None:
                 logger.critical(f"No stock price found for symbol: {symbol}")
@@ -322,17 +404,18 @@ async def get_stock_orders(session_id: str, symbol: str, stock_type: str, redis,
             """
             cursor.execute(asset_query, (user_id,))
             user_data_result = cursor.fetchone()
+            logger.critical(f"User asset query result: {user_data_result}")
 
             if user_data_result is None:
                 logger.critical(f"No user data found for user_id: {user_id}")
                 raise HTTPException(status_code=404, detail="사용자 자산 정보를 찾을 수 없습니다.")
 
             user_cash = int(user_data_result.get('cash', 0))
-            logger.critical(f"User cash: {user_cash}")
+            logger.critical(f"User cash for user_id {user_id}: {user_cash}")
 
             # 매수 가능 수량 = 사용자 자산 / 최신 주식 가격
             buyable_quantity = user_cash // stock_price if stock_price > 0 else 0
-            logger.critical(f"Buyable Quantity: {buyable_quantity}")
+            logger.critical(f"Calculated buyable quantity: {buyable_quantity}")
 
             return {
                 "symbol": symbol,
@@ -342,7 +425,7 @@ async def get_stock_orders(session_id: str, symbol: str, stock_type: str, redis,
             }
 
         # 매도 가능 수량 계산
-        elif stock_type == '매도':
+        elif stock_type == 'sell':
             stock_order_query = """
                 SELECT 
                     c.id AS company_id,
@@ -364,22 +447,26 @@ async def get_stock_orders(session_id: str, symbol: str, stock_type: str, redis,
             """
             cursor.execute(stock_order_query, (symbol, user_id))
             result = cursor.fetchone()
+            logger.critical(f"Stock order query result: {result}")
 
-            logger.critical(f"Query Result: {result}")
-
+            # 결과가 없으면 매도 가능 수량을 0으로 설정
             if result is None:
                 logger.critical(f"No order data found for user_id: {user_id} and symbol: {symbol}")
-                raise HTTPException(status_code=404, detail="주문 정보를 찾을 수 없습니다.")
+                return {
+                    "symbol": symbol,
+                    "company_id": None,
+                    "total_bought": 0,
+                    "total_sold": 0,
+                    "sellable_quantity": 0
+                }
 
             total_bought = int(result.get('total_bought', 0))
             total_sold = int(result.get('total_sold', 0))
             company_id = result.get('company_id')
-
-            logger.critical(f"Total Bought: {total_bought}, Total Sold: {total_sold}, Company ID: {company_id}")
+            logger.critical(f"Total bought: {total_bought}, Total sold: {total_sold}, Company ID: {company_id}")
 
             sellable_quantity = max(total_bought - total_sold, 0)
-
-            logger.critical(f"Sellable Quantity: {sellable_quantity}")
+            logger.critical(f"Calculated sellable quantity: {sellable_quantity}")
 
             return {
                 "symbol": symbol,
@@ -389,5 +476,12 @@ async def get_stock_orders(session_id: str, symbol: str, stock_type: str, redis,
                 "sellable_quantity": sellable_quantity
             }
     except Exception as e:
-        logger.critical(f"Error occurred: {e}")
+        logger.critical(f"Error occurred while processing get_stock_orders: {e}")
         raise HTTPException(status_code=500, detail="DB 조회 중 오류가 발생했습니다.")
+    finally:
+        if cursor:
+            cursor.close()
+            logger.critical("Database cursor closed")
+        if db:
+            db.close()
+            logger.critical("Database connection closed") 
