@@ -129,14 +129,17 @@ async def process_order(
                 logger.critical(f"체결 가격: {execution_price}, 체결 수량: {execution_quantity}")
 
             elif body.price_type == "지정가":
-                valid_asks = [ask for ask in ask_prices if ask["price"] <= body.price]
+                # 매수 지정가는 사용자가 입력한 가격과 정확히 일치하는 매도 호가만 거래
+                valid_asks = [ask for ask in ask_prices if ask["price"] == body.price]
                 if not valid_asks:
                     raise HTTPException(status_code=400, detail="지정가 매수 주문에 유효한 매도 호가가 없습니다.")
                 
-                lowest_ask = min(valid_asks, key=lambda x: x["price"])
-                execution_price = lowest_ask["price"]
-                execution_quantity = min(body.quantity, lowest_ask["volume"])
+                 # 체결은 사용자가 입력한 가격으로 이루어짐
+                exact_ask = valid_asks[0]  # 가장 첫 번째 일치하는 호가만 거래
+                execution_price = exact_ask["price"]
+                execution_quantity = min(body.quantity, exact_ask["volume"])
                 logger.critical(f"체결 가격: {execution_price}, 체결 수량: {execution_quantity}")
+        
 
             total_price = execution_price * execution_quantity if execution_price and execution_quantity else 0
             remaining_quantity = body.quantity - execution_quantity
@@ -200,14 +203,16 @@ async def process_order(
                 execution_quantity = min(body.quantity, highest_bid["volume"])
 
             elif body.price_type == "지정가":
-                valid_bids = [bid for bid in bid_prices if bid["price"] >= body.price]
+                # 매도 지정가는 사용자가 입력한 가격과 정확히 일치하는 매수 호가만 거래
+                valid_bids = [bid for bid in bid_prices if bid["price"] == body.price]
                 if not valid_bids:
                     raise HTTPException(status_code=400, detail="지정가 매도 주문에 유효한 매수 호가가 없습니다.")
                 
-                highest_bid = max(valid_bids, key=lambda x: x["price"])
-                execution_price = highest_bid["price"]
-                execution_quantity = min(body.quantity, highest_bid["volume"])
-
+                # 체결은 사용자가 입력한 가격으로 이루어짐
+                exact_bid = valid_bids[0]  # 가장 첫 번째 일치하는 호가만 거래
+                execution_price = exact_bid["price"]
+                execution_quantity = min(body.quantity, exact_bid["volume"])
+                
             total_price = execution_price * execution_quantity if execution_price and execution_quantity else 0
             remaining_quantity = body.quantity - execution_quantity
 

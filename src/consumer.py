@@ -4,8 +4,8 @@ import json
 async def async_kafka_consumer(topic: str, group_id: str) -> AIOKafkaConsumer:
     consumer = AIOKafkaConsumer(
         topic,
-        # bootstrap_servers=['kafka:9092'],
-        bootstrap_servers=['kafka-broker.stockly.svc.cluster.local:9092'],
+        bootstrap_servers=['kafka:9092'],
+        # bootstrap_servers=['kafka-broker.stockly.svc.cluster.local:9092'],
         group_id=group_id,
         auto_offset_reset='latest',
         enable_auto_commit=True,
